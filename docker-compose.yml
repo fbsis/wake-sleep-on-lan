@@ -1,0 +1,15 @@
+services:
+  wake-sleep:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    # Required for ICMP ping inside the container
+    cap_add:
+      - NET_RAW
+    # Needed for Wake-on-LAN broadcast to reach your LAN.
+    # On Linux this is the most reliable option.
+    network_mode: "host"
+    # If you can't use host networking (e.g. Docker Desktop), comment the line above
+    # and use explicit port mapping instead:
+    # ports:
+    #   - "8080:8080"
