@@ -37,6 +37,39 @@ Open in your browser: `http://YOUR_IP:8080`
 
 The UI status uses `ping` to detect if the server is online.
 
+## Update with Docker Compose
+Use this flow whenever you change code and want to reload the newest version:
+
+1. Go to the project folder:
+```bash
+cd /path/to/Wake-sleep-on-lan
+```
+
+2. (Optional, if using git) get the latest code:
+```bash
+git pull
+```
+
+3. Rebuild and recreate the service container:
+```bash
+docker compose up -d --build --force-recreate wake-sleep
+```
+
+4. Check if the service is up:
+```bash
+docker compose ps
+```
+
+5. Follow logs to confirm startup and test one action in the UI:
+```bash
+docker compose logs -f wake-sleep
+```
+
+If needed, restart without rebuild:
+```bash
+docker compose restart wake-sleep
+```
+
 ## Security
 - Use a strong SSH password or switch to a private key.
 - Keep SSH restricted to your internal network.
