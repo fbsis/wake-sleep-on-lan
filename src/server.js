@@ -23,7 +23,8 @@ const config = {
   sshPort: Number.parseInt(process.env.SSH_PORT || "22", 10),
   sshUser: process.env.SSH_USER || "root",
   sshPassword: process.env.SSH_PASS || "",
-  sleepCommand: process.env.SLEEP_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl suspend"
+  sleepCommand: process.env.SLEEP_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl suspend",
+  shutdownCommand: process.env.SHUTDOWN_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl poweroff"
 };
 
 function logInfo(message, extra = {}) {
@@ -91,7 +92,7 @@ function sendWakePacket(mac, broadcast, port) {
   });
 }
 
-function runSleepCommandOverSsh() {
+function runCommandOverSsh(command) {
   return new Promise((resolve, reject) => {
     const conn = new SshClient();
     let stderr = "";
@@ -99,7 +100,7 @@ function runSleepCommandOverSsh() {
 
     conn
       .on("ready", () => {
-        conn.exec(config.sleepCommand, (err, stream) => {
+        conn.exec(command, (err, stream) => {
           if (err) {
             conn.end();
             reject(err);
@@ -174,7 +175,7 @@ app.post("/api/wake", async (_req, res) => {
 
 app.post("/api/sleep", async (_req, res) => {
   try {
-    const result = await runSleepCommandOverSsh();
+    const result = await runCommandOverSsh(config.sleepCommand);
     logInfo("sleep_sent", {
       host: config.sleepHost,
       port: config.sshPort,
@@ -185,6 +186,23 @@ app.post("/api/sleep", async (_req, res) => {
     res.json({ ok: true });
   } catch (err) {
     logError("sleep_failed", { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/shutdown", async (_req, res) => {
+  try {
+    const result = await runCommandOverSsh(config.shutdownCommand);
+    logInfo("shutdown_sent", {
+      host: config.sleepHost,
+      port: config.sshPort,
+      user: config.sshUser,
+      stdout: result.stdout.trim(),
+      stderr: result.stderr.trim()
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    logError("shutdown_failed", { error: err.message });
     res.status(500).json({ ok: false, error: err.message });
   }
 });

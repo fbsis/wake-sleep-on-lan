@@ -1,12 +1,12 @@
-# Wake / Sleep on LAN (Node + Bash)
+# Wake / Sleep / Shutdown on LAN (Node + Bash)
 
 Simple project to:
 - **Wake** a machine via Wake-on-LAN.
 - **Sleep/Shutdown** a machine via SSH command.
 
 ## How it works
-- The Node server exposes a UI with two buttons: **Wake** and **Sleep**.
-- The sleep action runs a remote command over SSH on Proxmox.
+- The Node server exposes a UI with three buttons: **Wake**, **Sleep** and **Shutdown**.
+- Sleep and shutdown actions run remote commands over SSH on Proxmox.
 - You can also create schedules (cron-style or one-time) directly in the UI.
 
 ## Requirements
@@ -29,6 +29,7 @@ SSH_PORT=22 \
 SSH_USER=root \
 SSH_PASS="YOUR_PASSWORD" \
 SLEEP_COMMAND="/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl suspend" \
+SHUTDOWN_COMMAND="/bin/systemctl poweroff" \
 npm run server
 ```
 
