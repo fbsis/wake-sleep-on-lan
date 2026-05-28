@@ -33,14 +33,32 @@ const config = {
   shutdownCommand: process.env.SHUTDOWN_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl poweroff"
 };
 
+const logsList = [];
+const MAX_LOGS = 50;
+
+function addLogEntry(level, message, extra = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    message,
+    ...extra
+  };
+  logsList.unshift(entry);
+  if (logsList.length > MAX_LOGS) {
+    logsList.pop();
+  }
+}
+
 function logInfo(message, extra = {}) {
   const payload = { level: "info", message, ...extra, ts: new Date().toISOString() };
   console.log(JSON.stringify(payload));
+  addLogEntry("info", message, extra);
 }
 
 function logError(message, extra = {}) {
   const payload = { level: "error", message, ...extra, ts: new Date().toISOString() };
   console.error(JSON.stringify(payload));
+  addLogEntry("error", message, extra);
 }
 
 function validateConfig() {
@@ -417,7 +435,15 @@ app.get("/api/trigger/:action", async (req, res) => {
 
 app.get("/api/status", async (_req, res) => {
   const online = await pingHost(config.sleepHost);
-  res.json({ ok: true, online });
+  const now = new Date();
+  const serverTime = now.toLocaleString("pt-BR");
+  const tzOffset = -now.getTimezoneOffset() / 60;
+  const tzString = `UTC${tzOffset >= 0 ? "+" : ""}${tzOffset}`;
+  res.json({ ok: true, online, serverTime: `${serverTime} (${tzString})` });
+});
+
+app.get("/api/logs", (req, res) => {
+  res.json({ ok: true, logs: logsList });
 });
 
 app.post("/api/wake", async (_req, res) => {

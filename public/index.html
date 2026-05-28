@@ -166,6 +166,34 @@
             </div>
           </div>
 
+          <!-- Tabela de Logs Recentes -->
+          <div class="mb-4">
+            <h2 class="h5 mb-3 text-light d-flex align-items-center justify-content-between">
+              <span class="d-flex align-items-center gap-2">
+                <i class="bi bi-journal-text text-info"></i> Logs Recentes
+              </span>
+              <button class="btn btn-outline-secondary btn-sm" id="btnRefreshLogs" title="Atualizar Logs">
+                <i class="bi bi-arrow-clockwise"></i>
+              </button>
+            </h2>
+            <div class="table-responsive rounded-3 border border-secondary border-opacity-25" style="max-height: 250px; overflow-y: auto;">
+              <table class="table table-dark table-hover table-sm mb-0 align-middle" style="font-size: 0.8rem;">
+                <thead>
+                  <tr class="table-active">
+                    <th style="width: 25%">Horário</th>
+                    <th style="width: 25%">Evento</th>
+                    <th>Detalhes</th>
+                  </tr>
+                </thead>
+                <tbody id="logsTableBody">
+                  <tr>
+                    <td colspan="3" class="text-center text-secondary py-3">Carregando logs...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
           <hr class="my-4 border-secondary" />
 
           <div class="text-secondary small">
@@ -227,10 +255,11 @@
         if (!res.ok || !json.ok) {
           throw new Error("status_error");
         }
+        const timeSuffix = json.serverTime ? ` | Hora: ${json.serverTime}` : "";
         if (json.online) {
-          setStatus("Online", "Servidor acordado", "success");
+          setStatus("Online", `Servidor acordado${timeSuffix}`, "success");
         } else {
-          setStatus("Offline", "Servidor desligado", "secondary");
+          setStatus("Offline", `Servidor desligado${timeSuffix}`, "secondary");
         }
       } catch {
         setStatus("Erro", "Falha ao checar status", "danger");
@@ -365,6 +394,50 @@
     });
 
     updateCurlCommand();
+    // Logs Recentes
+    const logsTableBody = document.getElementById("logsTableBody");
+    const btnRefreshLogs = document.getElementById("btnRefreshLogs");
+
+    async function loadLogs() {
+      try {
+        const res = await fetch("/api/logs");
+        const json = await res.json();
+        if (res.ok && json.ok && json.logs) {
+          if (json.logs.length === 0) {
+            logsTableBody.innerHTML = `<tr><td colspan="3" class="text-center text-secondary py-3">Nenhum evento registrado</td></tr>`;
+            return;
+          }
+
+          logsTableBody.innerHTML = json.logs.map(log => {
+            const dateStr = new Date(log.ts).toLocaleString("pt-BR");
+            const badgeClass = log.level === "error" ? "bg-danger text-light" : "bg-info text-dark";
+            
+            let details = "";
+            const keys = Object.keys(log).filter(k => !["ts", "level", "message"].includes(k));
+            if (keys.length > 0) {
+              const detailsObj = {};
+              keys.forEach(k => detailsObj[k] = log[k]);
+              details = `<span class="text-secondary font-monospace" style="font-size: 0.72rem;">${JSON.stringify(detailsObj)}</span>`;
+            }
+
+            return `
+              <tr>
+                <td class="text-nowrap">${dateStr}</td>
+                <td><span class="badge ${badgeClass} font-monospace" style="font-size: 0.7rem;">${log.message}</span></td>
+                <td class="text-break">${details}</td>
+              </tr>
+            `;
+          }).join("");
+        }
+      } catch (err) {
+        console.error("Erro ao carregar logs:", err);
+      }
+    }
+
+    btnRefreshLogs.addEventListener("click", loadLogs);
+    setInterval(loadLogs, 5000);
+    loadLogs();
+
     loadSchedule();
     refreshStatus();
     setInterval(refreshStatus, 5000);
