@@ -136,6 +136,36 @@
             </div>
           </div>
 
+          <!-- API Externa -->
+          <div class="mb-4">
+            <h2 class="h5 mb-3 text-light d-flex align-items-center gap-2">
+              <i class="bi bi-code-slash text-info"></i> Integração Externa (API)
+            </h2>
+            <div class="p-3 rounded-3 bg-dark border border-secondary border-opacity-25">
+              <p class="small text-secondary mb-3">
+                Você pode acionar ações de outros dispositivos (como automações residenciais, scripts, IFTTT) enviando uma requisição <strong>GET</strong> simples:
+              </p>
+              
+              <div class="row align-items-center g-2 mb-3">
+                <div class="col-12 col-sm-6">
+                  <label class="small text-secondary mb-1">Selecione a ação para obter o comando curl:</label>
+                  <select class="form-select form-select-sm bg-secondary bg-opacity-10 text-light border-secondary" id="api_curl_action">
+                    <option value="ligar" selected>Ligar (Wake-on-LAN)</option>
+                    <option value="dormir">Dormir</option>
+                    <option value="desligar">Desligar</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="position-relative mt-2">
+                <pre class="bg-secondary bg-opacity-10 text-success p-2 rounded small mb-0 border border-secondary border-opacity-25 pe-5" style="overflow-x: auto; white-space: pre-wrap; word-break: break-all;" id="api_curl_code">curl -s http://localhost:8080/api/trigger/ligar</pre>
+                <button class="btn btn-sm btn-outline-secondary position-absolute top-50 end-0 translate-middle-y me-2" id="btnCopyCurl" title="Copiar comando">
+                  <i class="bi bi-copy"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+
           <hr class="my-4 border-secondary" />
 
           <div class="text-secondary small">
@@ -304,6 +334,37 @@
       }
     });
 
+    // Elementos de Integração Externa (CURL)
+    const apiCurlAction = document.getElementById("api_curl_action");
+    const apiCurlCode = document.getElementById("api_curl_code");
+    const btnCopyCurl = document.getElementById("btnCopyCurl");
+
+    function updateCurlCommand() {
+      const origin = window.location.origin;
+      const action = apiCurlAction.value;
+      apiCurlCode.textContent = `curl -s "${origin}/api/trigger/${action}"`;
+    }
+
+    apiCurlAction.addEventListener("change", updateCurlCommand);
+
+    btnCopyCurl.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(apiCurlCode.textContent);
+        const icon = btnCopyCurl.querySelector("i");
+        icon.className = "bi bi-check2 text-success";
+        btnCopyCurl.classList.add("btn-outline-success");
+        btnCopyCurl.classList.remove("btn-outline-secondary");
+        setTimeout(() => {
+          icon.className = "bi bi-copy";
+          btnCopyCurl.classList.remove("btn-outline-success");
+          btnCopyCurl.classList.add("btn-outline-secondary");
+        }, 2000);
+      } catch (err) {
+        console.error("Erro ao copiar:", err);
+      }
+    });
+
+    updateCurlCommand();
     loadSchedule();
     refreshStatus();
     setInterval(refreshStatus, 5000);

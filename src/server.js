@@ -373,6 +373,48 @@ app.post("/api/schedule", async (req, res) => {
   }
 });
 
+app.get("/api/trigger/:action", async (req, res) => {
+  const inputAction = req.params.action?.toLowerCase();
+  let action;
+
+  if (["wake", "ligar", "acordar"].includes(inputAction)) {
+    action = "wake";
+  } else if (["sleep", "dormir"].includes(inputAction)) {
+    action = "sleep";
+  } else if (["shutdown", "desligar"].includes(inputAction)) {
+    action = "shutdown";
+  }
+
+  if (!action) {
+    return res.status(400).json({ ok: false, error: "Ação inválida. Use: wake/ligar/acordar, sleep/dormir, ou shutdown/desligar." });
+  }
+
+  try {
+    if (action === "wake") {
+      await sendWakePacket(config.wakeMac, config.wakeBroadcast, config.wakePort);
+      logInfo("public_trigger_wake_sent", { mac: config.wakeMac });
+      resumeSavedVmsAfterWake()
+        .then(() => logInfo("public_trigger_hibernated_vms_resumed"))
+        .catch((err) => logError("public_trigger_hibernated_vms_resume_failed", { error: err.message }));
+      
+      return res.json({ ok: true, message: "Wake-on-LAN enviado com sucesso." });
+    } else if (action === "sleep") {
+      const result = await runCommandOverSsh(config.sleepCommand);
+      logInfo("public_trigger_sleep_sent", { host: config.sleepHost });
+      return res.json({ ok: true, message: "Comando de dormir enviado.", stdout: result.stdout.trim() });
+    } else if (action === "shutdown") {
+      const shouldHibernateVms = false;
+      await clearHibernatedVms();
+      const result = await runCommandOverSsh(config.shutdownCommand);
+      logInfo("public_trigger_shutdown_sent", { host: config.sleepHost });
+      return res.json({ ok: true, message: "Comando de desligamento enviado.", stdout: result.stdout.trim() });
+    }
+  } catch (err) {
+    logError("public_trigger_failed", { action, error: err.message });
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get("/api/status", async (_req, res) => {
   const online = await pingHost(config.sleepHost);
   res.json({ ok: true, online });
