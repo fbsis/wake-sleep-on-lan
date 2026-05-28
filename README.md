@@ -3,15 +3,17 @@
 Simple project to:
 - **Wake** a machine via Wake-on-LAN.
 - **Sleep/Shutdown** a machine via SSH command.
+- **Preserve and restore running Proxmox VMs** (Em construção/Desativado).
 
 ## How it works
 - The Node server exposes a UI with three buttons: **Wake**, **Sleep** and **Shutdown**.
 - Sleep and shutdown actions run remote commands over SSH on Proxmox.
-- You can also create schedules (cron-style or one-time) directly in the UI.
+- *(Funcionalidade sob desenvolvimento)*: Opção de hibernar as VMs Proxmox em execução antes de desligar (com `qm suspend`) e restaurá-las no próximo wake está desativada no momento por estar em construção.
 
 ## Requirements
 - Node.js 18+ (for the scripts in `src/`)
 - SSH access to the target host with permission to run the sleep command
+- Proxmox `qm` available for the SSH user used by the app
 
 ## Install
 ```bash

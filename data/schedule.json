@@ -1,0 +1,12 @@
+{
+  "schedule1": {
+    "enabled": true,
+    "time": "08:30",
+    "action": "wake"
+  },
+  "schedule2": {
+    "enabled": true,
+    "time": "02:00",
+    "action": "shutdown"
+  }
+}

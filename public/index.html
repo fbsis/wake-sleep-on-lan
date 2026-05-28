@@ -73,6 +73,71 @@
 
           <hr class="my-4 border-secondary" />
 
+          <!-- Agendamentos Diários -->
+          <div class="mb-4">
+            <h2 class="h5 mb-3 text-light d-flex align-items-center gap-2">
+              <i class="bi bi-clock-history text-success"></i> Agendamentos Diários
+            </h2>
+
+            <div class="row g-3">
+              <!-- Agendamento 1 -->
+              <div class="col-12 col-md-6">
+                <div class="p-3 rounded-3 bg-dark border border-secondary border-opacity-25 h-100">
+                  <div class="form-check form-switch mb-3">
+                    <input class="form-check-input" type="checkbox" role="switch" id="sched1_enabled">
+                    <label class="form-check-label fw-bold text-light" for="sched1_enabled">Agendamento 1</label>
+                  </div>
+                  <div class="row g-2">
+                    <div class="col-6">
+                      <label class="form-label small text-secondary mb-1">Horário</label>
+                      <input type="time" class="form-control form-control-sm bg-secondary bg-opacity-10 text-light border-secondary" id="sched1_time" value="08:00">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label small text-secondary mb-1">Ação</label>
+                      <select class="form-select form-select-sm bg-secondary bg-opacity-10 text-light border-secondary" id="sched1_action">
+                        <option value="wake" selected>Acordar</option>
+                        <option value="sleep">Dormir</option>
+                        <option value="shutdown">Desligar</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Agendamento 2 -->
+              <div class="col-12 col-md-6">
+                <div class="p-3 rounded-3 bg-dark border border-secondary border-opacity-25 h-100">
+                  <div class="form-check form-switch mb-3">
+                    <input class="form-check-input" type="checkbox" role="switch" id="sched2_enabled">
+                    <label class="form-check-label fw-bold text-light" for="sched2_enabled">Agendamento 2</label>
+                  </div>
+                  <div class="row g-2">
+                    <div class="col-6">
+                      <label class="form-label small text-secondary mb-1">Horário</label>
+                      <input type="time" class="form-control form-control-sm bg-secondary bg-opacity-10 text-light border-secondary" id="sched2_time" value="22:00">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label small text-secondary mb-1">Ação</label>
+                      <select class="form-select form-select-sm bg-secondary bg-opacity-10 text-light border-secondary" id="sched2_action">
+                        <option value="wake">Acordar</option>
+                        <option value="sleep">Dormir</option>
+                        <option value="shutdown" selected>Desligar</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="d-flex justify-content-end mt-3">
+              <button class="btn btn-outline-success btn-sm d-flex align-items-center gap-1" id="btnSaveSchedule">
+                <i class="bi bi-save me-1"></i> Salvar Agendamentos
+              </button>
+            </div>
+          </div>
+
+          <hr class="my-4 border-secondary" />
+
           <div class="text-secondary small">
             Dica: mantenha essa página aberta na rede interna. As ações são registradas no log do servidor.
           </div>
@@ -89,7 +154,16 @@
           <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Fechar"></button>
         </div>
         <div class="modal-body">
-          Tem certeza que deseja desligar o computador? Isso pode causar perda de dados não salvos.
+          <p class="mb-3">Tem certeza que deseja desligar o computador? Isso pode causar perda de dados não salvos.</p>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" value="" id="hibernateVmsOnShutdown" disabled>
+            <label class="form-check-label text-secondary text-opacity-50" for="hibernateVmsOnShutdown">
+              Hibernar VMs Proxmox em execução antes de desligar <span class="badge bg-warning text-dark ms-1" style="font-size: 0.7rem; vertical-align: middle;">Em construção</span>
+            </label>
+          </div>
+          <div class="small text-warning mt-2">
+            <i class="bi bi-exclamation-triangle-fill me-1"></i> Esta funcionalidade está em desenvolvimento e temporariamente desabilitada.
+          </div>
         </div>
         <div class="modal-footer border-secondary">
           <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">Cancelar</button>
@@ -107,6 +181,7 @@
     const btnSleep = document.getElementById("btnSleep");
     const btnShutdown = document.getElementById("btnShutdown");
     const btnConfirmShutdown = document.getElementById("btnConfirmShutdown");
+    const hibernateVmsOnShutdown = document.getElementById("hibernateVmsOnShutdown");
     const shutdownModal = new bootstrap.Modal(document.getElementById("shutdownModal"));
 
     function setStatus(state, detail, kind) {
@@ -132,15 +207,25 @@
       }
     }
 
-    async function callApi(path) {
+    async function callApi(path, body) {
       setStatus("Enviando", "Aguarde...", "info");
       try {
-        const res = await fetch(path, { method: "POST" });
+        const res = await fetch(path, {
+          method: "POST",
+          headers: body ? { "Content-Type": "application/json" } : undefined,
+          body: body ? JSON.stringify(body) : undefined
+        });
         const json = await res.json();
         if (!res.ok || !json.ok) {
           throw new Error(json.error || "Erro desconhecido");
         }
-        setStatus("OK", "Comando enviado", "success");
+        if (path === "/api/wake") {
+          setStatus("OK", "Wake enviado. VMs hibernadas serão restauradas quando o host responder.", "success");
+        } else if (path === "/api/shutdown" && body?.hibernateVms !== false) {
+          setStatus("OK", "Desligamento enviado com hibernação das VMs.", "success");
+        } else {
+          setStatus("OK", "Comando enviado", "success");
+        }
       } catch (err) {
         setStatus("Erro", err.message, "danger");
       }
@@ -151,9 +236,75 @@
     btnShutdown.addEventListener("click", () => shutdownModal.show());
     btnConfirmShutdown.addEventListener("click", () => {
       shutdownModal.hide();
-      callApi("/api/shutdown");
+      callApi("/api/shutdown", { hibernateVms: hibernateVmsOnShutdown.checked });
     });
 
+    // Elementos de Agendamento
+    const sched1_enabled = document.getElementById("sched1_enabled");
+    const sched1_time = document.getElementById("sched1_time");
+    const sched1_action = document.getElementById("sched1_action");
+
+    const sched2_enabled = document.getElementById("sched2_enabled");
+    const sched2_time = document.getElementById("sched2_time");
+    const sched2_action = document.getElementById("sched2_action");
+
+    const btnSaveSchedule = document.getElementById("btnSaveSchedule");
+
+    async function loadSchedule() {
+      try {
+        const res = await fetch("/api/schedule");
+        const json = await res.json();
+        if (res.ok && json.ok && json.schedule) {
+          const s1 = json.schedule.schedule1;
+          const s2 = json.schedule.schedule2;
+          if (s1) {
+            sched1_enabled.checked = !!s1.enabled;
+            sched1_time.value = s1.time || "08:00";
+            sched1_action.value = s1.action || "wake";
+          }
+          if (s2) {
+            sched2_enabled.checked = !!s2.enabled;
+            sched2_time.value = s2.time || "22:00";
+            sched2_action.value = s2.action || "shutdown";
+          }
+        }
+      } catch (err) {
+        console.error("Erro ao carregar agendamentos:", err);
+      }
+    }
+
+    btnSaveSchedule.addEventListener("click", async () => {
+      setStatus("Salvando", "Aguarde...", "info");
+      try {
+        const payload = {
+          schedule1: {
+            enabled: sched1_enabled.checked,
+            time: sched1_time.value,
+            action: sched1_action.value
+          },
+          schedule2: {
+            enabled: sched2_enabled.checked,
+            time: sched2_time.value,
+            action: sched2_action.value
+          }
+        };
+
+        const res = await fetch("/api/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const json = await res.json();
+        if (!res.ok || !json.ok) {
+          throw new Error(json.error || "Erro desconhecido ao salvar");
+        }
+        setStatus("OK", "Agendamentos salvos", "success");
+      } catch (err) {
+        setStatus("Erro", err.message, "danger");
+      }
+    });
+
+    loadSchedule();
     refreshStatus();
     setInterval(refreshStatus, 5000);
   </script>
