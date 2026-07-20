@@ -5,8 +5,9 @@ import dgram from "dgram";
 import net from "net";
 import { Client as SshClient } from "ssh2";
 import { spawn } from "child_process";
+import { constants as fsConstants } from "fs";
 import path from "path";
-import { appendFile, mkdir, readFile, rm, writeFile } from "fs/promises";
+import { access, appendFile, mkdir, readFile, rm, stat, writeFile } from "fs/promises";
 import { fileURLToPath } from "url";
 import schedule from "node-schedule";
 
@@ -964,6 +965,52 @@ function parseNpmDomainNames(value) {
     .filter(Boolean);
 }
 
+async function assertNpmSqliteAvailable() {
+  if (!config.npmSqlitePath) {
+    logError("npm_sqlite_path_missing", {
+      requiredWhen: "NPM_DISCOVERY_ENABLED=true"
+    });
+    throw new Error("NPM_SQLITE_PATH is required when NPM_DISCOVERY_ENABLED=true");
+  }
+
+  let fileStat;
+  try {
+    fileStat = await stat(config.npmSqlitePath);
+  } catch (err) {
+    logError("npm_sqlite_not_found", {
+      sqlitePath: config.npmSqlitePath,
+      error: err.message,
+      code: err.code
+    });
+    throw new Error(`NPM SQLite database not found at ${config.npmSqlitePath}`);
+  }
+
+  if (!fileStat.isFile()) {
+    logError("npm_sqlite_not_file", {
+      sqlitePath: config.npmSqlitePath,
+      type: fileStat.isDirectory() ? "directory" : "other"
+    });
+    throw new Error(`NPM SQLite path is not a file: ${config.npmSqlitePath}`);
+  }
+
+  try {
+    await access(config.npmSqlitePath, fsConstants.R_OK);
+  } catch (err) {
+    logError("npm_sqlite_not_readable", {
+      sqlitePath: config.npmSqlitePath,
+      error: err.message,
+      code: err.code
+    });
+    throw new Error(`NPM SQLite database is not readable at ${config.npmSqlitePath}`);
+  }
+
+  logInfo("npm_sqlite_found", {
+    sqlitePath: config.npmSqlitePath,
+    sizeBytes: fileStat.size,
+    mtime: fileStat.mtime.toISOString()
+  });
+}
+
 async function queryNpmProxyHosts() {
   const sql = `
 SELECT id, domain_names, forward_host, forward_port, advanced_config, enabled, is_deleted
@@ -992,6 +1039,7 @@ async function discoverNpmProxyRoutes() {
     return [];
   }
 
+  await assertNpmSqliteAvailable();
   const rows = await queryNpmProxyHosts();
   const forwardHostFilter = new Set(
     config.npmDiscoveryForwardHosts.map((host) => host.toLowerCase())
@@ -1079,9 +1127,6 @@ async function buildProxyRoutes() {
   }
   if (config.proxyTargetErrors.length > 0) {
     throw new Error(config.proxyTargetErrors.join("; "));
-  }
-  if (config.npmDiscoveryEnabled && !config.npmSqlitePath) {
-    throw new Error("NPM_SQLITE_PATH is required when NPM_DISCOVERY_ENABLED=true");
   }
 
   const routesByPort = new Map();

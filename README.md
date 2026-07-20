@@ -249,6 +249,22 @@ To inspect the routes loaded by the app:
 curl -s http://localhost:8080/api/proxy-routes
 ```
 
+On startup, check the Docker logs to confirm the NPM database mount:
+
+```bash
+docker compose logs -f wake-sleep
+```
+
+Expected successful events:
+
+```text
+npm_sqlite_found
+npm_discovery_complete
+proxy_routes_ready
+```
+
+If the mount/path is wrong, startup fails with `npm_sqlite_not_found`, `npm_sqlite_not_file`, or `npm_sqlite_not_readable`.
+
 For Docker on Linux, `network_mode: "host"` is recommended so Wake-on-LAN broadcast and the proxy listeners work directly on the LAN. If you cannot use host networking, publish the UI port and every selected proxy port:
 
 ```yaml
