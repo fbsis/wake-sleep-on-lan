@@ -166,6 +166,36 @@
             </div>
           </div>
 
+          <!-- Tabela de Uso do Proxy -->
+          <div class="mb-4">
+            <h2 class="h5 mb-3 text-light d-flex align-items-center justify-content-between">
+              <span class="d-flex align-items-center gap-2">
+                <i class="bi bi-diagram-3 text-success"></i> Uso do Proxy
+              </span>
+              <button class="btn btn-outline-secondary btn-sm" id="btnRefreshProxyUsage" title="Atualizar Uso do Proxy">
+                <i class="bi bi-arrow-clockwise"></i>
+              </button>
+            </h2>
+            <div class="table-responsive rounded-3 border border-secondary border-opacity-25" style="max-height: 260px; overflow-y: auto;">
+              <table class="table table-dark table-hover table-sm mb-0 align-middle" style="font-size: 0.8rem;">
+                <thead>
+                  <tr class="table-active">
+                    <th style="width: 22%">Horário</th>
+                    <th style="width: 18%">Cliente</th>
+                    <th style="width: 14%">Porta</th>
+                    <th style="width: 16%">Wake</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="proxyUsageTableBody">
+                  <tr>
+                    <td colspan="5" class="text-center text-secondary py-3">Carregando uso do proxy...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
           <!-- Tabela de Logs Recentes -->
           <div class="mb-4">
             <h2 class="h5 mb-3 text-light d-flex align-items-center justify-content-between">
@@ -394,6 +424,97 @@
     });
 
     updateCurlCommand();
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    // Uso do Proxy
+    const proxyUsageTableBody = document.getElementById("proxyUsageTableBody");
+    const btnRefreshProxyUsage = document.getElementById("btnRefreshProxyUsage");
+
+    function getWakeBadge(usage) {
+      if (usage.wakeSent) {
+        return `<span class="badge bg-success text-light">Enviado</span>`;
+      }
+      if (usage.wakeStatus === "cached") {
+        return `<span class="badge bg-warning text-dark">Cache</span>`;
+      }
+      if (usage.wakeStatus === "joined") {
+        return `<span class="badge bg-info text-dark">Aguardou</span>`;
+      }
+      if (usage.wakeStatus === "not_needed") {
+        return `<span class="badge bg-secondary text-light">Não precisou</span>`;
+      }
+      if (usage.wakeStatus === "failed") {
+        return `<span class="badge bg-danger text-light">Falhou</span>`;
+      }
+      return `<span class="badge bg-secondary text-light">${escapeHtml(usage.wakeStatus || "N/D")}</span>`;
+    }
+
+    function getUsageStatusBadge(status) {
+      if (status === "closed") {
+        return "bg-success text-light";
+      }
+      if (status === "failed") {
+        return "bg-danger text-light";
+      }
+      return "bg-secondary text-light";
+    }
+
+    async function loadProxyUsage() {
+      try {
+        const res = await fetch("/api/proxy-usage");
+        const json = await res.json();
+        if (res.ok && json.ok && json.usage) {
+          if (json.usage.length === 0) {
+            proxyUsageTableBody.innerHTML = `<tr><td colspan="5" class="text-center text-secondary py-3">Nenhum acesso pelo proxy registrado</td></tr>`;
+            return;
+          }
+
+          proxyUsageTableBody.innerHTML = json.usage.map(usage => {
+            const dateStr = new Date(usage.ts).toLocaleString("pt-BR");
+            const target = `${usage.targetHost || ""}:${usage.targetPort || usage.listenPort || ""}`;
+            const bytesTotal = Number(usage.bytesClientToTarget || 0) + Number(usage.bytesTargetToClient || 0);
+            const wakeDetail = usage.wakeStatus === "cached" && Number.isFinite(Number(usage.wakeCacheAgeMs))
+              ? ` ${Math.round(Number(usage.wakeCacheAgeMs) / 1000)}s`
+              : "";
+            const detail = [
+              `alvo=${target}`,
+              `bytes=${bytesTotal}`,
+              `duração=${usage.durationMs || 0}ms`
+            ];
+            if (usage.error) {
+              detail.push(`erro=${usage.error}`);
+            }
+
+            return `
+              <tr>
+                <td class="text-nowrap">${escapeHtml(dateStr)}</td>
+                <td class="text-break font-monospace" style="font-size: 0.72rem;">${escapeHtml(usage.client)}</td>
+                <td><span class="badge bg-dark border border-secondary text-light">${escapeHtml(usage.listenPort)}</span></td>
+                <td>${getWakeBadge(usage)}<span class="text-secondary small">${escapeHtml(wakeDetail)}</span></td>
+                <td>
+                  <span class="badge ${getUsageStatusBadge(usage.status)} font-monospace" style="font-size: 0.7rem;">${escapeHtml(usage.status)}</span>
+                  <div class="text-secondary font-monospace text-break" style="font-size: 0.72rem;">${escapeHtml(detail.join(" | "))}</div>
+                </td>
+              </tr>
+            `;
+          }).join("");
+        }
+      } catch (err) {
+        console.error("Erro ao carregar uso do proxy:", err);
+      }
+    }
+
+    btnRefreshProxyUsage.addEventListener("click", loadProxyUsage);
+    setInterval(loadProxyUsage, 5000);
+    loadProxyUsage();
+
     // Logs Recentes
     const logsTableBody = document.getElementById("logsTableBody");
     const btnRefreshLogs = document.getElementById("btnRefreshLogs");

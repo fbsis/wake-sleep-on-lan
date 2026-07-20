@@ -41,6 +41,29 @@ Open in your browser: `http://YOUR_IP:8080`
 
 The UI status uses `ping` to detect if the server is online.
 
+## Persistence
+When running with Docker Compose, the app persists runtime state in the host `data/` folder:
+
+- `data/schedule.json`: UI schedule settings.
+- `data/config.json`: last effective environment configuration used by the app.
+- `data/logs.jsonl`: persistent application logs shown in the UI.
+- `data/proxy-usage.jsonl`: persistent proxy usage table, including accessed ports and wake/cache decisions.
+- `data/hibernated-vms.json`: temporary VM resume state, when used.
+
+`docker-compose.yml` mounts this folder into the container as `/app/data`, so rebuilding or recreating the container does not erase these files.
+
+`data/config.json` may contain secrets such as `SSH_PASS`. Keep it private and do not commit it. The app still prefers `.env`; the persisted config is used as a fallback when a variable is missing from `.env`.
+
+Log persistence can be adjusted with:
+
+```bash
+STATE_DIR=./data
+LOG_PERSIST_ENABLED=true
+LOG_MAX_ENTRIES=200
+PROXY_USAGE_LOG_ENABLED=true
+PROXY_USAGE_LOG_MAX_ENTRIES=200
+```
+
 ## TCP wake proxy
 To make the app behave like a local redirector where each local port maps to the same remote port, enable the proxy:
 
@@ -61,6 +84,14 @@ With this enabled:
 - A client connecting to `localhost:9000` is forwarded to `192.168.1.50:9000`.
 
 For each connection, the app first tries the matching remote port. If it cannot connect, it sends the Wake-on-LAN packet, waits up to `PROXY_WAKE_TIMEOUT_MS`, and then starts forwarding bytes between the client and the remote service.
+
+Wake-on-LAN sends are cached for 5 minutes by default so repeated failed connection attempts do not keep sending magic packets:
+
+```bash
+PROXY_WAKE_CACHE_MS=300000
+```
+
+Set `PROXY_WAKE_CACHE_MS=0` to disable the cache. The UI shows proxy usage in a separate table, including the accessed port, target, whether Wake-on-LAN was sent, skipped by cache, joined to another wake attempt, or not needed because the remote port was already available.
 
 To automatically put the remote host to sleep after proxy traffic stops, enable idle sleep:
 
@@ -139,6 +170,13 @@ git pull
 
 3. Rebuild and recreate the service container:
 ```bash
+docker compose up -d --build --force-recreate wake-sleep
+```
+
+This preserves `data/` because it is mounted as a host volume. If this is the first run on a server, create the folder before starting:
+
+```bash
+mkdir -p data
 docker compose up -d --build --force-recreate wake-sleep
 ```
 

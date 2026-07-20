@@ -1,2 +1,7 @@
 node_modules/
 .env
+data/config.json
+data/schedule.json
+data/logs.jsonl
+data/proxy-usage.jsonl
+data/hibernated-vms.json

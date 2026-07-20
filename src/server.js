@@ -6,7 +6,7 @@ import net from "net";
 import { Client as SshClient } from "ssh2";
 import { spawn } from "child_process";
 import path from "path";
-import { mkdir, readFile, rm, writeFile } from "fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "fs/promises";
 import { fileURLToPath } from "url";
 import schedule from "node-schedule";
 
@@ -17,8 +17,13 @@ const app = express();
 app.use(express.json());
 app.use(morgan("combined"));
 
-const stateDir = path.join(__dirname, "..", "data");
+const stateDir = process.env.STATE_DIR
+  ? path.resolve(process.env.STATE_DIR)
+  : path.join(__dirname, "..", "data");
 const hibernatedVmsStatePath = path.join(stateDir, "hibernated-vms.json");
+const persistentConfigPath = path.join(stateDir, "config.json");
+const persistentLogsPath = path.join(stateDir, "logs.jsonl");
+const persistentProxyUsagePath = path.join(stateDir, "proxy-usage.jsonl");
 const schedulePath = path.join(stateDir, "schedule.json");
 
 function parseInteger(value, fallback) {
@@ -35,7 +40,13 @@ function parseBoolean(value, fallback = false) {
   if (value === undefined) {
     return fallback;
   }
-  return ["1", "true", "yes", "on", "sim"].includes(value.toLowerCase());
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  return ["1", "true", "yes", "on", "sim"].includes(String(value).trim().toLowerCase());
 }
 
 function parseProxyPorts(value) {
@@ -54,7 +65,7 @@ function parseProxyPorts(value) {
     ports.push(port);
   };
 
-  for (const rawToken of value.split(",")) {
+  for (const rawToken of String(value).split(",")) {
     const token = rawToken.trim();
     if (!token) {
       continue;
@@ -87,44 +98,257 @@ function parseProxyPorts(value) {
   return { ports: [...new Set(ports)], errors };
 }
 
-const proxyPortsConfig = parseProxyPorts(process.env.PROXY_PORTS || process.env.PROXY_LISTEN_PORT || "");
+async function loadPersistentConfig() {
+  try {
+    const raw = await readFile(persistentConfigPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed;
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return {};
+    }
+    console.error(JSON.stringify({
+      level: "error",
+      message: "persistent_config_load_failed",
+      error: err.message,
+      ts: new Date().toISOString()
+    }));
+    return {};
+  }
+}
+
+const persistentConfig = await loadPersistentConfig();
+
+function getConfigValue(name, fallback) {
+  return process.env[name] ?? persistentConfig[name] ?? fallback;
+}
+
+const proxyPortsSource = getConfigValue("PROXY_PORTS", getConfigValue("PROXY_LISTEN_PORT", ""));
+const proxyPortsConfig = parseProxyPorts(proxyPortsSource);
 
 const config = {
-  port: parseInteger(process.env.PORT, 8080),
-  wakeMac: process.env.WAKE_MAC || "",
-  wakeBroadcast: process.env.WAKE_BROADCAST || "255.255.255.255",
-  wakePort: parseInteger(process.env.WAKE_PORT, 9),
-  sleepHost: process.env.SLEEP_HOST || "",
-  sshPort: parseInteger(process.env.SSH_PORT, 22),
-  sshUser: process.env.SSH_USER || "root",
-  sshPassword: process.env.SSH_PASS || "",
-  sleepCommand: process.env.SLEEP_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl suspend",
-  shutdownCommand: process.env.SHUTDOWN_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl poweroff",
+  port: parseInteger(getConfigValue("PORT"), 8080),
+  wakeMac: getConfigValue("WAKE_MAC", ""),
+  wakeBroadcast: getConfigValue("WAKE_BROADCAST", "255.255.255.255"),
+  wakePort: parseInteger(getConfigValue("WAKE_PORT"), 9),
+  sleepHost: getConfigValue("SLEEP_HOST", ""),
+  sshPort: parseInteger(getConfigValue("SSH_PORT"), 22),
+  sshUser: getConfigValue("SSH_USER", "root"),
+  sshPassword: getConfigValue("SSH_PASS", ""),
+  sleepCommand: getConfigValue("SLEEP_COMMAND", "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl suspend"),
+  shutdownCommand: getConfigValue("SHUTDOWN_COMMAND", "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl poweroff"),
   proxyIdleSleepCommand:
-    process.env.PROXY_IDLE_SLEEP_COMMAND ||
-    process.env.SLEEP_COMMAND ||
+    getConfigValue("PROXY_IDLE_SLEEP_COMMAND") ||
+    getConfigValue("SLEEP_COMMAND") ||
     "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl suspend",
-  proxyEnabled: parseBoolean(process.env.PROXY_ENABLED),
-  proxyListenHost: process.env.PROXY_LISTEN_HOST || "0.0.0.0",
+  proxyEnabled: parseBoolean(getConfigValue("PROXY_ENABLED")),
+  proxyListenHost: getConfigValue("PROXY_LISTEN_HOST", "0.0.0.0"),
+  proxyPortsSource,
   proxyPorts: proxyPortsConfig.ports,
   proxyPortErrors: proxyPortsConfig.errors,
-  proxyTargetHost: process.env.PROXY_TARGET_HOST || process.env.SLEEP_HOST || "",
-  proxyConnectTimeoutMs: parseInteger(process.env.PROXY_CONNECT_TIMEOUT_MS, 1500),
-  proxyWakeTimeoutMs: parseInteger(process.env.PROXY_WAKE_TIMEOUT_MS, 120000),
-  proxyRetryDelayMs: parseInteger(process.env.PROXY_RETRY_DELAY_MS, 2000),
-  proxyIdleSleepEnabled: parseBoolean(process.env.PROXY_IDLE_SLEEP_ENABLED),
-  proxyIdleSleepTimeoutMs: parseInteger(process.env.PROXY_IDLE_SLEEP_TIMEOUT_MS, 1800000),
-  proxyIdleSleepRequireNoConnections: parseBoolean(process.env.PROXY_IDLE_SLEEP_REQUIRE_NO_CONNECTIONS, true),
-  proxyIdleRemoteCheckEnabled: parseBoolean(process.env.PROXY_IDLE_REMOTE_CHECK_ENABLED, true),
-  proxyIdleRemoteCheckSeconds: parseInteger(process.env.PROXY_IDLE_REMOTE_CHECK_SECONDS, 120),
-  proxyIdleRemoteCpuMaxPercent: parseNumber(process.env.PROXY_IDLE_REMOTE_CPU_MAX_PERCENT, 10),
-  proxyIdleRemoteNetMaxBytesPerSecond: parseNumber(process.env.PROXY_IDLE_REMOTE_NET_MAX_BYTES_PER_SECOND, 4096),
-  proxyIdleRemoteNetInterfaces: process.env.PROXY_IDLE_REMOTE_NET_INTERFACES || "",
-  proxyIdleRemoteNetExcludeRegex: process.env.PROXY_IDLE_REMOTE_NET_EXCLUDE_REGEX || "^lo$"
+  proxyTargetHost: getConfigValue("PROXY_TARGET_HOST") || getConfigValue("SLEEP_HOST", ""),
+  proxyConnectTimeoutMs: parseInteger(getConfigValue("PROXY_CONNECT_TIMEOUT_MS"), 1500),
+  proxyWakeCacheMs: parseInteger(getConfigValue("PROXY_WAKE_CACHE_MS"), 300000),
+  proxyWakeTimeoutMs: parseInteger(getConfigValue("PROXY_WAKE_TIMEOUT_MS"), 120000),
+  proxyRetryDelayMs: parseInteger(getConfigValue("PROXY_RETRY_DELAY_MS"), 2000),
+  proxyIdleSleepEnabled: parseBoolean(getConfigValue("PROXY_IDLE_SLEEP_ENABLED")),
+  proxyIdleSleepTimeoutMs: parseInteger(getConfigValue("PROXY_IDLE_SLEEP_TIMEOUT_MS"), 1800000),
+  proxyIdleSleepRequireNoConnections: parseBoolean(getConfigValue("PROXY_IDLE_SLEEP_REQUIRE_NO_CONNECTIONS"), true),
+  proxyIdleRemoteCheckEnabled: parseBoolean(getConfigValue("PROXY_IDLE_REMOTE_CHECK_ENABLED"), true),
+  proxyIdleRemoteCheckSeconds: parseInteger(getConfigValue("PROXY_IDLE_REMOTE_CHECK_SECONDS"), 120),
+  proxyIdleRemoteCpuMaxPercent: parseNumber(getConfigValue("PROXY_IDLE_REMOTE_CPU_MAX_PERCENT"), 10),
+  proxyIdleRemoteNetMaxBytesPerSecond: parseNumber(getConfigValue("PROXY_IDLE_REMOTE_NET_MAX_BYTES_PER_SECOND"), 4096),
+  proxyIdleRemoteNetInterfaces: getConfigValue("PROXY_IDLE_REMOTE_NET_INTERFACES", ""),
+  proxyIdleRemoteNetExcludeRegex: getConfigValue("PROXY_IDLE_REMOTE_NET_EXCLUDE_REGEX", "^lo$"),
+  proxyUsageLogEnabled: parseBoolean(getConfigValue("PROXY_USAGE_LOG_ENABLED"), true),
+  proxyUsageLogMaxEntries: parseInteger(getConfigValue("PROXY_USAGE_LOG_MAX_ENTRIES"), 200),
+  logMaxEntries: parseInteger(getConfigValue("LOG_MAX_ENTRIES"), 200),
+  logPersistEnabled: parseBoolean(getConfigValue("LOG_PERSIST_ENABLED"), true)
 };
 
 const logsList = [];
-const MAX_LOGS = 50;
+const MAX_LOGS = config.logMaxEntries;
+const proxyUsageList = [];
+const MAX_PROXY_USAGE_LOGS = config.proxyUsageLogMaxEntries;
+
+function getPersistentConfigPayload() {
+  return {
+    savedAt: new Date().toISOString(),
+    PORT: config.port,
+    WAKE_MAC: config.wakeMac,
+    WAKE_BROADCAST: config.wakeBroadcast,
+    WAKE_PORT: config.wakePort,
+    SLEEP_HOST: config.sleepHost,
+    SSH_PORT: config.sshPort,
+    SSH_USER: config.sshUser,
+    SSH_PASS: config.sshPassword,
+    SLEEP_COMMAND: config.sleepCommand,
+    SHUTDOWN_COMMAND: config.shutdownCommand,
+    PROXY_ENABLED: config.proxyEnabled,
+    PROXY_LISTEN_HOST: config.proxyListenHost,
+    PROXY_PORTS: config.proxyPortsSource,
+    PROXY_TARGET_HOST: config.proxyTargetHost,
+    PROXY_CONNECT_TIMEOUT_MS: config.proxyConnectTimeoutMs,
+    PROXY_WAKE_CACHE_MS: config.proxyWakeCacheMs,
+    PROXY_WAKE_TIMEOUT_MS: config.proxyWakeTimeoutMs,
+    PROXY_RETRY_DELAY_MS: config.proxyRetryDelayMs,
+    PROXY_IDLE_SLEEP_ENABLED: config.proxyIdleSleepEnabled,
+    PROXY_IDLE_SLEEP_TIMEOUT_MS: config.proxyIdleSleepTimeoutMs,
+    PROXY_IDLE_SLEEP_REQUIRE_NO_CONNECTIONS: config.proxyIdleSleepRequireNoConnections,
+    PROXY_IDLE_SLEEP_COMMAND: config.proxyIdleSleepCommand,
+    PROXY_IDLE_REMOTE_CHECK_ENABLED: config.proxyIdleRemoteCheckEnabled,
+    PROXY_IDLE_REMOTE_CHECK_SECONDS: config.proxyIdleRemoteCheckSeconds,
+    PROXY_IDLE_REMOTE_CPU_MAX_PERCENT: config.proxyIdleRemoteCpuMaxPercent,
+    PROXY_IDLE_REMOTE_NET_MAX_BYTES_PER_SECOND: config.proxyIdleRemoteNetMaxBytesPerSecond,
+    PROXY_IDLE_REMOTE_NET_INTERFACES: config.proxyIdleRemoteNetInterfaces,
+    PROXY_IDLE_REMOTE_NET_EXCLUDE_REGEX: config.proxyIdleRemoteNetExcludeRegex,
+    PROXY_USAGE_LOG_ENABLED: config.proxyUsageLogEnabled,
+    PROXY_USAGE_LOG_MAX_ENTRIES: config.proxyUsageLogMaxEntries,
+    LOG_MAX_ENTRIES: config.logMaxEntries,
+    LOG_PERSIST_ENABLED: config.logPersistEnabled
+  };
+}
+
+async function savePersistentConfig() {
+  await ensureStateDir();
+  await writeFile(persistentConfigPath, JSON.stringify(getPersistentConfigPayload(), null, 2), "utf8");
+}
+
+async function persistLogEntry(entry) {
+  if (!config.logPersistEnabled) {
+    return;
+  }
+
+  await ensureStateDir();
+  await appendFile(persistentLogsPath, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+async function compactPersistentLogs(entries) {
+  if (!config.logPersistEnabled) {
+    return;
+  }
+
+  await ensureStateDir();
+  const chronologicalEntries = [...entries].reverse();
+  const content = chronologicalEntries.map((entry) => JSON.stringify(entry)).join("\n");
+  await writeFile(persistentLogsPath, content ? `${content}\n` : "", "utf8");
+}
+
+async function loadPersistentLogs() {
+  if (!config.logPersistEnabled) {
+    return;
+  }
+
+  try {
+    const raw = await readFile(persistentLogsPath, "utf8");
+    const entries = raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .slice(-MAX_LOGS)
+      .reverse();
+
+    logsList.length = 0;
+    logsList.push(...entries);
+    await compactPersistentLogs(entries);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.error(JSON.stringify({
+        level: "error",
+        message: "persistent_logs_load_failed",
+        error: err.message,
+        ts: new Date().toISOString()
+      }));
+    }
+  }
+}
+
+async function persistProxyUsageEntry(entry) {
+  if (!config.proxyUsageLogEnabled) {
+    return;
+  }
+
+  await ensureStateDir();
+  await appendFile(persistentProxyUsagePath, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+async function compactPersistentProxyUsage(entries) {
+  if (!config.proxyUsageLogEnabled) {
+    return;
+  }
+
+  await ensureStateDir();
+  const chronologicalEntries = [...entries].reverse();
+  const content = chronologicalEntries.map((entry) => JSON.stringify(entry)).join("\n");
+  await writeFile(persistentProxyUsagePath, content ? `${content}\n` : "", "utf8");
+}
+
+async function loadPersistentProxyUsage() {
+  if (!config.proxyUsageLogEnabled) {
+    return;
+  }
+
+  try {
+    const raw = await readFile(persistentProxyUsagePath, "utf8");
+    const entries = raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .slice(-MAX_PROXY_USAGE_LOGS)
+      .reverse();
+
+    proxyUsageList.length = 0;
+    proxyUsageList.push(...entries);
+    await compactPersistentProxyUsage(entries);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.error(JSON.stringify({
+        level: "error",
+        message: "persistent_proxy_usage_load_failed",
+        error: err.message,
+        ts: new Date().toISOString()
+      }));
+    }
+  }
+}
+
+function addProxyUsageEntry(entry) {
+  const normalizedEntry = {
+    ts: new Date().toISOString(),
+    ...entry
+  };
+
+  proxyUsageList.unshift(normalizedEntry);
+  if (proxyUsageList.length > MAX_PROXY_USAGE_LOGS) {
+    proxyUsageList.pop();
+  }
+
+  persistProxyUsageEntry(normalizedEntry).catch((err) => {
+    console.error(JSON.stringify({
+      level: "error",
+      message: "persistent_proxy_usage_write_failed",
+      error: err.message,
+      ts: new Date().toISOString()
+    }));
+  });
+}
 
 function addLogEntry(level, message, extra = {}) {
   const entry = {
@@ -137,6 +361,14 @@ function addLogEntry(level, message, extra = {}) {
   if (logsList.length > MAX_LOGS) {
     logsList.pop();
   }
+  persistLogEntry(entry).catch((err) => {
+    console.error(JSON.stringify({
+      level: "error",
+      message: "persistent_log_write_failed",
+      error: err.message,
+      ts: new Date().toISOString()
+    }));
+  });
 }
 
 function logInfo(message, extra = {}) {
@@ -170,6 +402,12 @@ function validateConfig() {
   if (!config.sshPassword) {
     throw new Error("SSH_PASS is required");
   }
+  if (!Number.isFinite(config.logMaxEntries) || config.logMaxEntries <= 0) {
+    throw new Error("LOG_MAX_ENTRIES is invalid");
+  }
+  if (!Number.isFinite(config.proxyUsageLogMaxEntries) || config.proxyUsageLogMaxEntries <= 0) {
+    throw new Error("PROXY_USAGE_LOG_MAX_ENTRIES is invalid");
+  }
   if (config.proxyEnabled) {
     if (!config.proxyTargetHost) {
       throw new Error("PROXY_TARGET_HOST or SLEEP_HOST is required when PROXY_ENABLED=true");
@@ -185,6 +423,9 @@ function validateConfig() {
     }
     if (!Number.isFinite(config.proxyConnectTimeoutMs) || config.proxyConnectTimeoutMs <= 0) {
       throw new Error("PROXY_CONNECT_TIMEOUT_MS is invalid");
+    }
+    if (!Number.isFinite(config.proxyWakeCacheMs) || config.proxyWakeCacheMs < 0) {
+      throw new Error("PROXY_WAKE_CACHE_MS is invalid");
     }
     if (!Number.isFinite(config.proxyWakeTimeoutMs) || config.proxyWakeTimeoutMs <= 0) {
       throw new Error("PROXY_WAKE_TIMEOUT_MS is invalid");
@@ -443,7 +684,8 @@ function connectToTcpPort(host, port, timeoutMs) {
   });
 }
 
-const proxyWakeInFlightByPort = new Map();
+const proxyWakeInFlightByTarget = new Map();
+const proxyLastWakeSentAtByTarget = new Map();
 let proxyActiveConnections = 0;
 let proxyLastTrafficAt = null;
 let proxyIdleSleepTimer = null;
@@ -458,8 +700,8 @@ function createProxyRoute(listenPort) {
   };
 }
 
-function getProxyRouteKey(route) {
-  return `${route.targetHost}:${route.targetPort}`;
+function getProxyWakeCacheKey(route) {
+  return `${config.wakeMac}|${route.targetHost}`;
 }
 
 function clearProxyIdleSleepTimer() {
@@ -746,47 +988,111 @@ async function waitForProxyTargetPort(route) {
   );
 }
 
-async function wakeAndWaitForProxyTarget(route) {
-  const routeKey = getProxyRouteKey(route);
-  const existingWake = proxyWakeInFlightByPort.get(routeKey);
+async function ensureProxyWakeSignal(route) {
+  const wakeKey = getProxyWakeCacheKey(route);
+  const now = Date.now();
+  const lastWakeSentAt = proxyLastWakeSentAtByTarget.get(wakeKey);
 
+  if (
+    lastWakeSentAt &&
+    config.proxyWakeCacheMs > 0 &&
+    now - lastWakeSentAt < config.proxyWakeCacheMs
+  ) {
+    const wakeCacheAgeMs = now - lastWakeSentAt;
+    logInfo("proxy_wake_cache_hit", {
+      targetHost: route.targetHost,
+      targetPort: route.targetPort,
+      wakeCacheAgeMs,
+      wakeCacheMs: config.proxyWakeCacheMs
+    });
+    return {
+      wakeStatus: "cached",
+      wakeSent: false,
+      wakeCacheAgeMs,
+      wakeCacheMs: config.proxyWakeCacheMs
+    };
+  }
+
+  const existingWake = proxyWakeInFlightByTarget.get(wakeKey);
   if (existingWake) {
     logInfo("proxy_wake_wait_joined", {
       targetHost: route.targetHost,
       targetPort: route.targetPort
     });
-    return existingWake;
+    await existingWake;
+    return {
+      wakeStatus: "joined",
+      wakeSent: false,
+      wakeCacheMs: config.proxyWakeCacheMs
+    };
   }
 
   const wakePromise = (async () => {
     await sendWakePacket(config.wakeMac, config.wakeBroadcast, config.wakePort);
+    proxyLastWakeSentAtByTarget.set(wakeKey, Date.now());
     logInfo("proxy_wake_sent", {
       mac: config.wakeMac,
       broadcast: config.wakeBroadcast,
       port: config.wakePort,
       targetHost: route.targetHost,
-      targetPort: route.targetPort
+      targetPort: route.targetPort,
+      wakeCacheMs: config.proxyWakeCacheMs
     });
-    await waitForProxyTargetPort(route);
   })().finally(() => {
-    proxyWakeInFlightByPort.delete(routeKey);
+    proxyWakeInFlightByTarget.delete(wakeKey);
   });
 
-  proxyWakeInFlightByPort.set(routeKey, wakePromise);
-  return wakePromise;
+  proxyWakeInFlightByTarget.set(wakeKey, wakePromise);
+  await wakePromise;
+  return {
+    wakeStatus: "sent",
+    wakeSent: true,
+    wakeCacheMs: config.proxyWakeCacheMs
+  };
 }
 
 async function openProxyTargetSocket(route) {
   try {
-    return await connectToTcpPort(route.targetHost, route.targetPort, config.proxyConnectTimeoutMs);
+    const socket = await connectToTcpPort(route.targetHost, route.targetPort, config.proxyConnectTimeoutMs);
+    return {
+      socket,
+      meta: {
+        targetInitiallyAvailable: true,
+        wakeStatus: "not_needed",
+        wakeSent: false
+      }
+    };
   } catch (err) {
     logInfo("proxy_target_unavailable_waking", {
       host: route.targetHost,
       port: route.targetPort,
       error: err.message
     });
-    await wakeAndWaitForProxyTarget(route);
-    return connectToTcpPort(route.targetHost, route.targetPort, config.proxyConnectTimeoutMs);
+    let wakeMeta = {
+      wakeStatus: "failed",
+      wakeSent: false
+    };
+
+    try {
+      wakeMeta = await ensureProxyWakeSignal(route);
+      await waitForProxyTargetPort(route);
+      const socket = await connectToTcpPort(route.targetHost, route.targetPort, config.proxyConnectTimeoutMs);
+      return {
+        socket,
+        meta: {
+          targetInitiallyAvailable: false,
+          initialConnectError: err.message,
+          ...wakeMeta
+        }
+      };
+    } catch (wakeErr) {
+      wakeErr.proxyUsageMeta = {
+        targetInitiallyAvailable: false,
+        initialConnectError: err.message,
+        ...wakeMeta
+      };
+      throw wakeErr;
+    }
   }
 }
 
@@ -794,6 +1100,37 @@ async function handleProxyConnection(clientSocket, route) {
   const client = `${clientSocket.remoteAddress || "unknown"}:${clientSocket.remotePort || "unknown"}`;
   let targetSocket = null;
   let clientClosed = false;
+  let targetReady = false;
+  let usageRecorded = false;
+  let bytesClientToTarget = 0;
+  let bytesTargetToClient = 0;
+  let usageMeta = {
+    targetInitiallyAvailable: null,
+    wakeStatus: "unknown",
+    wakeSent: false
+  };
+  const startedAt = Date.now();
+
+  const finalizeProxyUsage = (status, extra = {}) => {
+    if (usageRecorded) {
+      return;
+    }
+    usageRecorded = true;
+    addProxyUsageEntry({
+      startedAt: new Date(startedAt).toISOString(),
+      durationMs: Date.now() - startedAt,
+      client,
+      listenPort: route.listenPort,
+      targetHost: route.targetHost,
+      targetPort: route.targetPort,
+      status,
+      targetReady,
+      bytesClientToTarget,
+      bytesTargetToClient,
+      ...usageMeta,
+      ...extra
+    });
+  };
 
   proxyActiveConnections += 1;
   clearProxyIdleSleepTimer();
@@ -809,6 +1146,9 @@ async function handleProxyConnection(clientSocket, route) {
     if (targetSocket && !targetSocket.destroyed) {
       targetSocket.destroy();
     }
+    if (targetReady) {
+      finalizeProxyUsage("closed");
+    }
     scheduleProxyIdleSleepCheck();
   });
 
@@ -820,13 +1160,21 @@ async function handleProxyConnection(clientSocket, route) {
       targetPort: route.targetPort
     });
 
-    targetSocket = await openProxyTargetSocket(route);
+    const targetResult = await openProxyTargetSocket(route);
+    targetSocket = targetResult.socket;
+    usageMeta = {
+      ...usageMeta,
+      ...targetResult.meta
+    };
+
     if (clientClosed || clientSocket.destroyed) {
       targetSocket.destroy();
       logInfo("proxy_client_disconnected_before_target_ready", { client });
+      finalizeProxyUsage("client_disconnected_before_target_ready");
       return;
     }
 
+    targetReady = true;
     targetSocket.setKeepAlive(true);
 
     targetSocket.on("error", (err) => {
@@ -847,9 +1195,11 @@ async function handleProxyConnection(clientSocket, route) {
     clientSocket.pipe(targetSocket);
     targetSocket.pipe(clientSocket);
     clientSocket.on("data", (chunk) => {
+      bytesClientToTarget += chunk.length;
       markProxyTraffic(chunk.length);
     });
     targetSocket.on("data", (chunk) => {
+      bytesTargetToClient += chunk.length;
       markProxyTraffic(chunk.length);
     });
     clientSocket.resume();
@@ -861,6 +1211,11 @@ async function handleProxyConnection(clientSocket, route) {
       targetPort: route.targetPort
     });
   } catch (err) {
+    usageMeta = {
+      ...usageMeta,
+      ...(err.proxyUsageMeta || {})
+    };
+    finalizeProxyUsage("failed", { error: err.message });
     logError("proxy_connection_failed", {
       client,
       listenPort: route.listenPort,
@@ -1103,6 +1458,10 @@ app.get("/api/logs", (req, res) => {
   res.json({ ok: true, logs: logsList });
 });
 
+app.get("/api/proxy-usage", (req, res) => {
+  res.json({ ok: true, usage: proxyUsageList });
+});
+
 app.post("/api/wake", async (_req, res) => {
   try {
     await sendWakePacket(config.wakeMac, config.wakeBroadcast, config.wakePort);
@@ -1169,6 +1528,17 @@ app.post("/api/shutdown", async (req, res) => {
 
 try {
   validateConfig();
+  await ensureStateDir();
+  await loadPersistentLogs();
+  await loadPersistentProxyUsage();
+  await savePersistentConfig();
+  logInfo("persistence_ready", {
+    stateDir,
+    configPath: persistentConfigPath,
+    logsPath: persistentLogsPath,
+    proxyUsagePath: persistentProxyUsagePath,
+    logMaxEntries: config.logMaxEntries
+  });
   await loadSchedule();
   await startWakeProxy();
   app.listen(config.port, () => {
