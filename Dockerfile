@@ -1,8 +1,8 @@
 FROM node:18-slim
 
-# Install ping for status checks
+# Install ping for status checks and sqlite3 for Nginx Proxy Manager discovery
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends iputils-ping \
+  && apt-get install -y --no-install-recommends iputils-ping sqlite3 \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

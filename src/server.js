@@ -98,6 +98,131 @@ function parseProxyPorts(value) {
   return { ports: [...new Set(ports)], errors };
 }
 
+function parseList(value) {
+  if (!value) {
+    return [];
+  }
+  return String(value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parsePort(value, label) {
+  if (!/^\d+$/.test(String(value).trim())) {
+    throw new Error(`${label} must be a TCP port`);
+  }
+
+  const port = Number.parseInt(String(value).trim(), 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error(`${label} must be between 1 and 65535`);
+  }
+
+  return port;
+}
+
+function parseTargetAddress(value, fallbackPort, label = "target") {
+  const target = String(value || "").trim();
+  if (!target) {
+    throw new Error(`${label} is empty`);
+  }
+
+  const bracketIpv6Match = target.match(/^\[([^\]]+)](?::(\d+))?$/);
+  if (bracketIpv6Match) {
+    if (!bracketIpv6Match[1].trim()) {
+      throw new Error(`${label} host is empty`);
+    }
+    return {
+      host: bracketIpv6Match[1],
+      port: bracketIpv6Match[2]
+        ? parsePort(bracketIpv6Match[2], `${label} port`)
+        : parsePort(fallbackPort, `${label} fallback port`)
+    };
+  }
+
+  const lastColonIndex = target.lastIndexOf(":");
+  if (lastColonIndex > 0 && /^\d+$/.test(target.slice(lastColonIndex + 1))) {
+    const host = target.slice(0, lastColonIndex).trim();
+    if (!host) {
+      throw new Error(`${label} host is empty`);
+    }
+    return {
+      host,
+      port: parsePort(target.slice(lastColonIndex + 1), `${label} port`)
+    };
+  }
+
+  if (fallbackPort !== undefined && fallbackPort !== null && fallbackPort !== "") {
+    if (!target) {
+      throw new Error(`${label} host is empty`);
+    }
+    return {
+      host: target,
+      port: parsePort(fallbackPort, `${label} fallback port`)
+    };
+  }
+
+  throw new Error(`${label} must be host:port`);
+}
+
+function normalizeGuestKind(value) {
+  const kind = String(value || "").trim().toLowerCase();
+  if (["vm", "qemu", "qm"].includes(kind)) {
+    return "vm";
+  }
+  if (["lxc", "ct", "container", "pct"].includes(kind)) {
+    return "lxc";
+  }
+  return "";
+}
+
+function parseGuestId(value) {
+  const parsed = Number.parseInt(String(value || "").trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseProxyTargetSpecs(value) {
+  const routes = [];
+  const errors = [];
+
+  if (!value) {
+    return { routes, errors };
+  }
+
+  for (const rawToken of String(value).split(",")) {
+    const token = rawToken.trim();
+    if (!token) {
+      continue;
+    }
+
+    const separatorIndex = token.indexOf("=");
+    if (separatorIndex <= 0) {
+      errors.push(`Invalid PROXY_TARGETS entry "${token}". Use listenPort=host:targetPort`);
+      continue;
+    }
+
+    try {
+      const listenPort = parsePort(token.slice(0, separatorIndex), "PROXY_TARGETS listen port");
+      const target = parseTargetAddress(
+        token.slice(separatorIndex + 1),
+        listenPort,
+        "PROXY_TARGETS target"
+      );
+
+      routes.push({
+        listenPort,
+        targetHost: target.host,
+        targetPort: target.port,
+        source: "env"
+      });
+    } catch (err) {
+      errors.push(`Invalid PROXY_TARGETS entry "${token}": ${err.message}`);
+    }
+  }
+
+  return { routes, errors };
+}
+
 async function loadPersistentConfig() {
   try {
     const raw = await readFile(persistentConfigPath, "utf8");
@@ -128,6 +253,8 @@ function getConfigValue(name, fallback) {
 
 const proxyPortsSource = getConfigValue("PROXY_PORTS", getConfigValue("PROXY_LISTEN_PORT", ""));
 const proxyPortsConfig = parseProxyPorts(proxyPortsSource);
+const proxyTargetsSource = getConfigValue("PROXY_TARGETS", "");
+const proxyTargetsConfig = parseProxyTargetSpecs(proxyTargetsSource);
 
 const config = {
   port: parseInteger(getConfigValue("PORT"), 8080),
@@ -149,11 +276,17 @@ const config = {
   proxyPortsSource,
   proxyPorts: proxyPortsConfig.ports,
   proxyPortErrors: proxyPortsConfig.errors,
+  proxyTargetsSource,
+  proxyTargetRoutes: proxyTargetsConfig.routes,
+  proxyTargetErrors: proxyTargetsConfig.errors,
   proxyTargetHost: getConfigValue("PROXY_TARGET_HOST") || getConfigValue("SLEEP_HOST", ""),
   proxyConnectTimeoutMs: parseInteger(getConfigValue("PROXY_CONNECT_TIMEOUT_MS"), 1500),
   proxyWakeCacheMs: parseInteger(getConfigValue("PROXY_WAKE_CACHE_MS"), 300000),
   proxyWakeTimeoutMs: parseInteger(getConfigValue("PROXY_WAKE_TIMEOUT_MS"), 120000),
   proxyRetryDelayMs: parseInteger(getConfigValue("PROXY_RETRY_DELAY_MS"), 2000),
+  proxyGuestStartEnabled: parseBoolean(getConfigValue("PROXY_GUEST_START_ENABLED")),
+  proxyGuestStartTimeoutMs: parseInteger(getConfigValue("PROXY_GUEST_START_TIMEOUT_MS"), 120000),
+  proxyGuestStartRetryDelayMs: parseInteger(getConfigValue("PROXY_GUEST_START_RETRY_DELAY_MS"), 3000),
   proxyIdleSleepEnabled: parseBoolean(getConfigValue("PROXY_IDLE_SLEEP_ENABLED")),
   proxyIdleSleepTimeoutMs: parseInteger(getConfigValue("PROXY_IDLE_SLEEP_TIMEOUT_MS"), 1800000),
   proxyIdleSleepRequireNoConnections: parseBoolean(getConfigValue("PROXY_IDLE_SLEEP_REQUIRE_NO_CONNECTIONS"), true),
@@ -165,6 +298,11 @@ const config = {
   proxyIdleRemoteNetExcludeRegex: getConfigValue("PROXY_IDLE_REMOTE_NET_EXCLUDE_REGEX", "^lo$"),
   proxyUsageLogEnabled: parseBoolean(getConfigValue("PROXY_USAGE_LOG_ENABLED"), true),
   proxyUsageLogMaxEntries: parseInteger(getConfigValue("PROXY_USAGE_LOG_MAX_ENTRIES"), 200),
+  npmDiscoveryEnabled: parseBoolean(getConfigValue("NPM_DISCOVERY_ENABLED")),
+  npmSqlitePath: getConfigValue("NPM_SQLITE_PATH", ""),
+  npmSqliteCommand: getConfigValue("NPM_SQLITE_COMMAND", "sqlite3"),
+  npmDiscoveryForwardHosts: parseList(getConfigValue("NPM_DISCOVERY_FORWARD_HOSTS", "")),
+  npmDiscoveryCommentPrefix: getConfigValue("NPM_DISCOVERY_COMMENT_PREFIX", "wake-sleep"),
   logMaxEntries: parseInteger(getConfigValue("LOG_MAX_ENTRIES"), 200),
   logPersistEnabled: parseBoolean(getConfigValue("LOG_PERSIST_ENABLED"), true)
 };
@@ -190,11 +328,15 @@ function getPersistentConfigPayload() {
     PROXY_ENABLED: config.proxyEnabled,
     PROXY_LISTEN_HOST: config.proxyListenHost,
     PROXY_PORTS: config.proxyPortsSource,
+    PROXY_TARGETS: config.proxyTargetsSource,
     PROXY_TARGET_HOST: config.proxyTargetHost,
     PROXY_CONNECT_TIMEOUT_MS: config.proxyConnectTimeoutMs,
     PROXY_WAKE_CACHE_MS: config.proxyWakeCacheMs,
     PROXY_WAKE_TIMEOUT_MS: config.proxyWakeTimeoutMs,
     PROXY_RETRY_DELAY_MS: config.proxyRetryDelayMs,
+    PROXY_GUEST_START_ENABLED: config.proxyGuestStartEnabled,
+    PROXY_GUEST_START_TIMEOUT_MS: config.proxyGuestStartTimeoutMs,
+    PROXY_GUEST_START_RETRY_DELAY_MS: config.proxyGuestStartRetryDelayMs,
     PROXY_IDLE_SLEEP_ENABLED: config.proxyIdleSleepEnabled,
     PROXY_IDLE_SLEEP_TIMEOUT_MS: config.proxyIdleSleepTimeoutMs,
     PROXY_IDLE_SLEEP_REQUIRE_NO_CONNECTIONS: config.proxyIdleSleepRequireNoConnections,
@@ -207,6 +349,11 @@ function getPersistentConfigPayload() {
     PROXY_IDLE_REMOTE_NET_EXCLUDE_REGEX: config.proxyIdleRemoteNetExcludeRegex,
     PROXY_USAGE_LOG_ENABLED: config.proxyUsageLogEnabled,
     PROXY_USAGE_LOG_MAX_ENTRIES: config.proxyUsageLogMaxEntries,
+    NPM_DISCOVERY_ENABLED: config.npmDiscoveryEnabled,
+    NPM_SQLITE_PATH: config.npmSqlitePath,
+    NPM_SQLITE_COMMAND: config.npmSqliteCommand,
+    NPM_DISCOVERY_FORWARD_HOSTS: config.npmDiscoveryForwardHosts.join(","),
+    NPM_DISCOVERY_COMMENT_PREFIX: config.npmDiscoveryCommentPrefix,
     LOG_MAX_ENTRIES: config.logMaxEntries,
     LOG_PERSIST_ENABLED: config.logPersistEnabled
   };
@@ -383,7 +530,7 @@ function logError(message, extra = {}) {
   addLogEntry("error", message, extra);
 }
 
-function validateConfig() {
+function validateConfig(proxyRoutes = []) {
   if (!config.wakeMac) {
     throw new Error("WAKE_MAC is required");
   }
@@ -409,17 +556,20 @@ function validateConfig() {
     throw new Error("PROXY_USAGE_LOG_MAX_ENTRIES is invalid");
   }
   if (config.proxyEnabled) {
-    if (!config.proxyTargetHost) {
-      throw new Error("PROXY_TARGET_HOST or SLEEP_HOST is required when PROXY_ENABLED=true");
-    }
     if (config.proxyPortErrors.length > 0) {
       throw new Error(config.proxyPortErrors.join("; "));
     }
-    if (config.proxyPorts.length === 0) {
-      throw new Error("PROXY_PORTS is required when PROXY_ENABLED=true");
+    if (config.proxyTargetErrors.length > 0) {
+      throw new Error(config.proxyTargetErrors.join("; "));
     }
-    if (config.proxyPorts.includes(config.port)) {
-      throw new Error("PROXY_PORTS must not include PORT");
+    if (config.npmDiscoveryEnabled && !config.npmSqlitePath) {
+      throw new Error("NPM_SQLITE_PATH is required when NPM_DISCOVERY_ENABLED=true");
+    }
+    if (proxyRoutes.length === 0) {
+      throw new Error("No proxy routes configured. Use PROXY_TARGETS, NPM discovery, or PROXY_PORTS with PROXY_TARGET_HOST");
+    }
+    if (proxyRoutes.some((route) => route.listenPort === config.port)) {
+      throw new Error("Proxy listen ports must not include PORT");
     }
     if (!Number.isFinite(config.proxyConnectTimeoutMs) || config.proxyConnectTimeoutMs <= 0) {
       throw new Error("PROXY_CONNECT_TIMEOUT_MS is invalid");
@@ -432,6 +582,12 @@ function validateConfig() {
     }
     if (!Number.isFinite(config.proxyRetryDelayMs) || config.proxyRetryDelayMs <= 0) {
       throw new Error("PROXY_RETRY_DELAY_MS is invalid");
+    }
+    if (!Number.isFinite(config.proxyGuestStartTimeoutMs) || config.proxyGuestStartTimeoutMs <= 0) {
+      throw new Error("PROXY_GUEST_START_TIMEOUT_MS is invalid");
+    }
+    if (!Number.isFinite(config.proxyGuestStartRetryDelayMs) || config.proxyGuestStartRetryDelayMs <= 0) {
+      throw new Error("PROXY_GUEST_START_RETRY_DELAY_MS is invalid");
     }
     if (config.proxyIdleSleepEnabled) {
       if (!config.proxyIdleSleepCommand) {
@@ -684,12 +840,307 @@ function connectToTcpPort(host, port, timeoutMs) {
   });
 }
 
+function runProcess(command, args, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      proc.kill("SIGTERM");
+      reject(new Error(`${command} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    proc.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+    proc.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+    proc.on("error", (err) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      reject(err);
+    });
+    proc.on("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(`${command} exited with code ${code}: ${stderr.trim() || stdout.trim()}`));
+      }
+    });
+  });
+}
+
+function parseKeyValueMetadata(input) {
+  const metadata = {};
+  const tokenRegex = /([a-zA-Z0-9_-]+)=("[^"]*"|'[^']*'|[^\s#]+)/g;
+  let match;
+
+  while ((match = tokenRegex.exec(input)) !== null) {
+    const key = match[1].trim().toLowerCase();
+    let value = match[2].trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    metadata[key] = value;
+  }
+
+  return metadata;
+}
+
+function parseNpmWakeMetadata(advancedConfig, fallbackTargetPort, markerPrefix) {
+  const marker = String(markerPrefix || "wake-sleep").trim();
+  const markerRegex = new RegExp(`^#\\s*${marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+  const line = String(advancedConfig || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find((item) => markerRegex.test(item));
+
+  if (!line) {
+    return null;
+  }
+
+  const metadata = parseKeyValueMetadata(line.replace(markerRegex, "").trim());
+  const targetValue = metadata.target || metadata.to;
+  if (!targetValue) {
+    throw new Error(`NPM Advanced marker "${marker}" requires target=host:port`);
+  }
+
+  const target = parseTargetAddress(targetValue, fallbackTargetPort, "NPM Advanced target");
+  const guestKind = normalizeGuestKind(metadata.kind || metadata.type || metadata.guest);
+  const guestId = parseGuestId(metadata.id || metadata.vmid || metadata.ctid);
+
+  if ((guestKind && !guestId) || (!guestKind && guestId)) {
+    throw new Error("NPM Advanced guest metadata requires both kind=vm|lxc and id=<number>");
+  }
+
+  return {
+    targetHost: target.host,
+    targetPort: target.port,
+    guestKind,
+    guestId,
+    rawMetadata: metadata
+  };
+}
+
+function parseNpmDomainNames(value) {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).filter(Boolean);
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => String(item)).filter(Boolean);
+    }
+  } catch {
+    // Nginx Proxy Manager usually stores JSON here, but keep plain strings usable.
+  }
+
+  return String(value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+async function queryNpmProxyHosts() {
+  const sql = `
+SELECT id, domain_names, forward_host, forward_port, advanced_config, enabled, is_deleted
+FROM proxy_host
+WHERE COALESCE(enabled, 1) = 1
+  AND COALESCE(is_deleted, 0) = 0;
+`.trim();
+
+  const result = await runProcess(
+    config.npmSqliteCommand,
+    ["-readonly", "-json", config.npmSqlitePath, sql],
+    15000
+  );
+
+  const output = result.stdout.trim() || "[]";
+  const rows = JSON.parse(output);
+  if (!Array.isArray(rows)) {
+    throw new Error("NPM SQLite query did not return a JSON array");
+  }
+
+  return rows;
+}
+
+async function discoverNpmProxyRoutes() {
+  if (!config.npmDiscoveryEnabled) {
+    return [];
+  }
+
+  const rows = await queryNpmProxyHosts();
+  const forwardHostFilter = new Set(
+    config.npmDiscoveryForwardHosts.map((host) => host.toLowerCase())
+  );
+  const routes = [];
+
+  for (const row of rows) {
+    const listenPort = Number.parseInt(row.forward_port, 10);
+    const forwardHost = String(row.forward_host || "").trim();
+
+    if (!Number.isInteger(listenPort) || listenPort <= 0 || listenPort > 65535) {
+      continue;
+    }
+    if (
+      forwardHostFilter.size > 0 &&
+      !forwardHostFilter.has(forwardHost.toLowerCase())
+    ) {
+      continue;
+    }
+
+    let metadata;
+    try {
+      metadata = parseNpmWakeMetadata(
+        row.advanced_config,
+        listenPort,
+        config.npmDiscoveryCommentPrefix
+      );
+    } catch (err) {
+      throw new Error(`NPM proxy_host id=${row.id}: ${err.message}`);
+    }
+
+    if (!metadata) {
+      continue;
+    }
+
+    routes.push({
+      listenHost: config.proxyListenHost,
+      listenPort,
+      targetHost: metadata.targetHost,
+      targetPort: metadata.targetPort,
+      source: "npm",
+      npmProxyHostId: row.id,
+      npmForwardHost: forwardHost,
+      npmForwardPort: listenPort,
+      domains: parseNpmDomainNames(row.domain_names),
+      guestKind: metadata.guestKind,
+      guestId: metadata.guestId,
+      rawMetadata: metadata.rawMetadata
+    });
+  }
+
+  logInfo("npm_discovery_complete", {
+    sqlitePath: config.npmSqlitePath,
+    proxyHostsRead: rows.length,
+    routesDiscovered: routes.length,
+    forwardHostFilter: config.npmDiscoveryForwardHosts.join(",") || "none"
+  });
+
+  return routes;
+}
+
+function normalizeProxyRoute(route) {
+  return {
+    listenHost: route.listenHost || config.proxyListenHost,
+    listenPort: route.listenPort,
+    targetHost: route.targetHost,
+    targetPort: route.targetPort,
+    source: route.source || "global",
+    npmProxyHostId: route.npmProxyHostId,
+    npmForwardHost: route.npmForwardHost,
+    npmForwardPort: route.npmForwardPort,
+    domains: route.domains || [],
+    guestKind: route.guestKind || "",
+    guestId: route.guestId || null,
+    rawMetadata: route.rawMetadata || {}
+  };
+}
+
+async function buildProxyRoutes() {
+  if (!config.proxyEnabled) {
+    return [];
+  }
+  if (config.proxyPortErrors.length > 0) {
+    throw new Error(config.proxyPortErrors.join("; "));
+  }
+  if (config.proxyTargetErrors.length > 0) {
+    throw new Error(config.proxyTargetErrors.join("; "));
+  }
+  if (config.npmDiscoveryEnabled && !config.npmSqlitePath) {
+    throw new Error("NPM_SQLITE_PATH is required when NPM_DISCOVERY_ENABLED=true");
+  }
+
+  const routesByPort = new Map();
+
+  const addRoute = (route) => {
+    const normalizedRoute = normalizeProxyRoute(route);
+    const existingRoute = routesByPort.get(normalizedRoute.listenPort);
+    if (existingRoute) {
+      logInfo("proxy_route_skipped_duplicate", {
+        listenPort: normalizedRoute.listenPort,
+        keptSource: existingRoute.source,
+        skippedSource: normalizedRoute.source
+      });
+      return;
+    }
+    routesByPort.set(normalizedRoute.listenPort, normalizedRoute);
+  };
+
+  for (const route of config.proxyTargetRoutes) {
+    addRoute(route);
+  }
+
+  for (const route of await discoverNpmProxyRoutes()) {
+    addRoute(route);
+  }
+
+  for (const listenPort of config.proxyPorts) {
+    if (routesByPort.has(listenPort)) {
+      continue;
+    }
+    if (!config.proxyTargetHost) {
+      throw new Error(
+        `PROXY_TARGET_HOST or PROXY_TARGETS is required for PROXY_PORTS entry ${listenPort}`
+      );
+    }
+    addRoute(createProxyRoute(listenPort));
+  }
+
+  const routes = [...routesByPort.values()].sort((a, b) => a.listenPort - b.listenPort);
+  logInfo("proxy_routes_ready", {
+    count: routes.length,
+    routes: routes.map((route) => ({
+      listenPort: route.listenPort,
+      target: `${route.targetHost}:${route.targetPort}`,
+      source: route.source,
+      domains: route.domains,
+      guest: route.guestKind && route.guestId ? `${route.guestKind}:${route.guestId}` : ""
+    }))
+  });
+  return routes;
+}
+
 const proxyWakeInFlightByTarget = new Map();
 const proxyLastWakeSentAtByTarget = new Map();
 let proxyActiveConnections = 0;
 let proxyLastTrafficAt = null;
 let proxyIdleSleepTimer = null;
 let proxyIdleSleepInFlight = null;
+let activeProxyRoutes = [];
 
 function createProxyRoute(listenPort) {
   return {
@@ -1051,6 +1502,87 @@ async function ensureProxyWakeSignal(route) {
   };
 }
 
+function buildProxyGuestStartCommand(route) {
+  if (!route.guestKind || !route.guestId) {
+    return "";
+  }
+
+  if (route.guestKind === "lxc") {
+    return `
+if pct status ${route.guestId} 2>/dev/null | grep -q 'status: running'; then
+  echo "lxc_${route.guestId}_already_running"
+else
+  pct start ${route.guestId}
+fi
+`.trim();
+  }
+
+  if (route.guestKind === "vm") {
+    return `
+status="$(qm status ${route.guestId} 2>/dev/null || true)"
+case "$status" in
+  *running*) echo "vm_${route.guestId}_already_running" ;;
+  *suspended*) qm resume ${route.guestId} ;;
+  *) qm start ${route.guestId} ;;
+esac
+`.trim();
+  }
+
+  return "";
+}
+
+async function ensureProxyGuestStarted(route) {
+  if (!config.proxyGuestStartEnabled || !route.guestKind || !route.guestId) {
+    return {
+      guestStartStatus: "not_configured"
+    };
+  }
+
+  const command = buildProxyGuestStartCommand(route);
+  if (!command) {
+    return {
+      guestStartStatus: "not_supported"
+    };
+  }
+
+  const deadline = Date.now() + config.proxyGuestStartTimeoutMs;
+  let attempt = 0;
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    attempt += 1;
+    try {
+      const result = await runCommandOverSsh(command);
+      logInfo("proxy_guest_start_checked", {
+        targetHost: route.targetHost,
+        targetPort: route.targetPort,
+        guestKind: route.guestKind,
+        guestId: route.guestId,
+        attempt,
+        stdout: result.stdout.trim(),
+        stderr: result.stderr.trim()
+      });
+      return {
+        guestStartStatus: "checked",
+        guestStartAttempt: attempt,
+        guestKind: route.guestKind,
+        guestId: route.guestId
+      };
+    } catch (err) {
+      lastError = err;
+      await delay(Math.min(
+        config.proxyGuestStartRetryDelayMs,
+        Math.max(deadline - Date.now(), 0)
+      ));
+    }
+  }
+
+  throw new Error(
+    `Guest ${route.guestKind}:${route.guestId} could not be started or checked over SSH` +
+      (lastError ? ` (${lastError.message})` : "")
+  );
+}
+
 async function openProxyTargetSocket(route) {
   try {
     const socket = await connectToTcpPort(route.targetHost, route.targetPort, config.proxyConnectTimeoutMs);
@@ -1075,6 +1607,7 @@ async function openProxyTargetSocket(route) {
 
     try {
       wakeMeta = await ensureProxyWakeSignal(route);
+      const guestStartMeta = await ensureProxyGuestStarted(route);
       await waitForProxyTargetPort(route);
       const socket = await connectToTcpPort(route.targetHost, route.targetPort, config.proxyConnectTimeoutMs);
       return {
@@ -1082,6 +1615,7 @@ async function openProxyTargetSocket(route) {
         meta: {
           targetInitiallyAvailable: false,
           initialConnectError: err.message,
+          ...guestStartMeta,
           ...wakeMeta
         }
       };
@@ -1123,6 +1657,10 @@ async function handleProxyConnection(clientSocket, route) {
       listenPort: route.listenPort,
       targetHost: route.targetHost,
       targetPort: route.targetPort,
+      source: route.source,
+      domains: route.domains,
+      guestKind: route.guestKind,
+      guestId: route.guestId,
       status,
       targetReady,
       bytesClientToTarget,
@@ -1157,7 +1695,11 @@ async function handleProxyConnection(clientSocket, route) {
       client,
       listenPort: route.listenPort,
       targetHost: route.targetHost,
-      targetPort: route.targetPort
+      targetPort: route.targetPort,
+      source: route.source,
+      domains: route.domains,
+      guestKind: route.guestKind,
+      guestId: route.guestId
     });
 
     const targetResult = await openProxyTargetSocket(route);
@@ -1221,6 +1763,7 @@ async function handleProxyConnection(clientSocket, route) {
       listenPort: route.listenPort,
       targetHost: route.targetHost,
       targetPort: route.targetPort,
+      source: route.source,
       error: err.message
     });
     clientSocket.destroy();
@@ -1234,6 +1777,7 @@ function startWakeProxyListener(route) {
         listenPort: route.listenPort,
         targetHost: route.targetHost,
         targetPort: route.targetPort,
+        source: route.source,
         error: err.message
       });
       clientSocket.destroy();
@@ -1252,7 +1796,11 @@ function startWakeProxyListener(route) {
         listenHost: route.listenHost,
         listenPort: route.listenPort,
         targetHost: route.targetHost,
-        targetPort: route.targetPort
+        targetPort: route.targetPort,
+        source: route.source,
+        domains: route.domains,
+        guestKind: route.guestKind,
+        guestId: route.guestId
       });
       resolve(proxyServer);
     };
@@ -1263,12 +1811,12 @@ function startWakeProxyListener(route) {
   });
 }
 
-async function startWakeProxy() {
+async function startWakeProxy(proxyRoutes) {
   if (!config.proxyEnabled) {
     return [];
   }
 
-  return Promise.all(config.proxyPorts.map((port) => startWakeProxyListener(createProxyRoute(port))));
+  return Promise.all(proxyRoutes.map((route) => startWakeProxyListener(route)));
 }
 
 async function executeAction(action) {
@@ -1462,6 +2010,25 @@ app.get("/api/proxy-usage", (req, res) => {
   res.json({ ok: true, usage: proxyUsageList });
 });
 
+app.get("/api/proxy-routes", (req, res) => {
+  res.json({
+    ok: true,
+    routes: activeProxyRoutes.map((route) => ({
+      listenHost: route.listenHost,
+      listenPort: route.listenPort,
+      targetHost: route.targetHost,
+      targetPort: route.targetPort,
+      source: route.source,
+      domains: route.domains,
+      guestKind: route.guestKind,
+      guestId: route.guestId,
+      npmProxyHostId: route.npmProxyHostId,
+      npmForwardHost: route.npmForwardHost,
+      npmForwardPort: route.npmForwardPort
+    }))
+  });
+});
+
 app.post("/api/wake", async (_req, res) => {
   try {
     await sendWakePacket(config.wakeMac, config.wakeBroadcast, config.wakePort);
@@ -1527,10 +2094,12 @@ app.post("/api/shutdown", async (req, res) => {
 });
 
 try {
-  validateConfig();
   await ensureStateDir();
   await loadPersistentLogs();
   await loadPersistentProxyUsage();
+  const proxyRoutes = await buildProxyRoutes();
+  activeProxyRoutes = proxyRoutes;
+  validateConfig(proxyRoutes);
   await savePersistentConfig();
   logInfo("persistence_ready", {
     stateDir,
@@ -1540,7 +2109,7 @@ try {
     logMaxEntries: config.logMaxEntries
   });
   await loadSchedule();
-  await startWakeProxy();
+  await startWakeProxy(proxyRoutes);
   app.listen(config.port, () => {
     logInfo("server_listening", { port: config.port });
   });

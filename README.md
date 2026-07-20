@@ -9,7 +9,8 @@ Simple project to:
 ## How it works
 - The Node server exposes a UI with three buttons: **Wake**, **Sleep** and **Shutdown**.
 - Sleep and shutdown actions run remote commands over SSH on Proxmox.
-- Optional TCP proxy mode listens on configured local ports, checks the same port on the remote target, sends Wake-on-LAN if the target is down, waits until that remote TCP port is available, then forwards all traffic to it.
+- Optional TCP proxy mode listens on configured local ports, checks the target port on the real destination, sends Wake-on-LAN if the target is down, waits until that remote TCP port is available, then forwards all traffic to it.
+- Optional Nginx Proxy Manager discovery reads NPM's SQLite database and uses `# wake-sleep ...` comments in the Advanced field to discover the real VM/LXC target behind each proxy host.
 - *(Funcionalidade sob desenvolvimento)*: Opção de hibernar as VMs Proxmox em execução antes de desligar (com `qm suspend`) e restaurá-las no próximo wake está desativada no momento por estar em construção.
 
 ## Requirements
@@ -65,7 +66,7 @@ PROXY_USAGE_LOG_MAX_ENTRIES=200
 ```
 
 ## TCP wake proxy
-To make the app behave like a local redirector where each local port maps to the same remote port, enable the proxy:
+For the simple fallback mode, each local port maps to the same port on `PROXY_TARGET_HOST`:
 
 ```bash
 PROXY_ENABLED=true \
@@ -139,6 +140,114 @@ PROXY_PORTS=2222,6790,9000,10000-10010
 ```
 
 The app can only receive connections on ports it is listening on, so include every local port you want to support.
+
+To map each local port to a different remote host, use `PROXY_TARGETS`:
+
+```bash
+PROXY_ENABLED=true
+PROXY_TARGETS=8096=192.168.1.115:8096,9000=192.168.1.116:9000
+```
+
+`PROXY_TARGETS` entries take priority over Nginx Proxy Manager discovery and over the older `PROXY_PORTS` + `PROXY_TARGET_HOST` fallback.
+
+## Nginx Proxy Manager discovery
+Use this when Nginx Proxy Manager should send traffic to `wake-sleep`, but the real service is inside a VM/LXC with a different IP.
+
+Flow:
+
+```text
+client -> NPM domain -> wake-sleep:8096
+wake-sleep reads NPM metadata -> 192.168.1.115:8096
+if target is down -> Wake-on-LAN Proxmox host
+if enabled and metadata exists -> pct start/qm start guest
+wake-sleep waits for 192.168.1.115:8096
+wake-sleep forwards the TCP connection
+```
+
+In Nginx Proxy Manager, configure the proxy host like this:
+
+```text
+Domain Names:
+media.home.fbsis.com
+
+Forward Hostname/IP:
+wake-sleep
+
+Forward Port:
+8096
+```
+
+If `wake-sleep` runs with `network_mode: "host"` and NPM runs in a normal Docker bridge network, use the Docker host IP instead of `wake-sleep`:
+
+```text
+Forward Hostname/IP:
+192.168.1.100
+
+Forward Port:
+8096
+```
+
+In the NPM **Advanced** field, add one comment line with the real destination:
+
+```nginx
+# wake-sleep target=192.168.1.115:8096 kind=lxc id=115
+```
+
+For a VM, use:
+
+```nginx
+# wake-sleep target=192.168.1.115:8096 kind=vm id=101
+```
+
+`target=` is required. `kind=` and `id=` are optional unless you want the app to start the Proxmox guest automatically. Supported guest kinds are `lxc` and `vm`.
+
+Mount the NPM data folder read-only into this container. The NPM data folder is the host folder that NPM mounts as `/data`, where `database.sqlite` lives when NPM uses SQLite.
+
+```yaml
+services:
+  wake-sleep:
+    volumes:
+      - ./data:/app/data
+      - /path/to/nginx-proxy-manager/data:/npm-data:ro
+```
+
+Enable discovery:
+
+```bash
+PROXY_ENABLED=true
+PROXY_PORTS=
+NPM_DISCOVERY_ENABLED=true
+NPM_SQLITE_PATH=/npm-data/database.sqlite
+NPM_DISCOVERY_COMMENT_PREFIX=wake-sleep
+```
+
+Optional filter, if you want the app to accept only NPM rows whose `Forward Hostname/IP` points to this service:
+
+```bash
+NPM_DISCOVERY_FORWARD_HOSTS=wake-sleep,127.0.0.1
+```
+
+To let the app start the VM/LXC after Wake-on-LAN, enable:
+
+```bash
+PROXY_GUEST_START_ENABLED=true
+PROXY_GUEST_START_TIMEOUT_MS=120000
+PROXY_GUEST_START_RETRY_DELAY_MS=3000
+```
+
+Guest start commands run over SSH against `SLEEP_HOST`, so `SLEEP_HOST` should be the Proxmox host IP and `SSH_USER` must be allowed to run `qm`/`pct`.
+
+After changing NPM proxy hosts or Advanced comments, restart `wake-sleep` so it rereads the SQLite database and binds any new ports:
+
+```bash
+docker compose restart wake-sleep
+```
+
+To inspect the routes loaded by the app:
+
+```bash
+curl -s http://localhost:8080/api/proxy-routes
+```
 
 For Docker on Linux, `network_mode: "host"` is recommended so Wake-on-LAN broadcast and the proxy listeners work directly on the LAN. If you cannot use host networking, publish the UI port and every selected proxy port:
 

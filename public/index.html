@@ -485,9 +485,13 @@
               : "";
             const detail = [
               `alvo=${target}`,
+              `origem=${usage.source || "n/d"}`,
               `bytes=${bytesTotal}`,
               `duração=${usage.durationMs || 0}ms`
             ];
+            if (usage.guestKind && usage.guestId) {
+              detail.push(`guest=${usage.guestKind}:${usage.guestId}`);
+            }
             if (usage.error) {
               detail.push(`erro=${usage.error}`);
             }
