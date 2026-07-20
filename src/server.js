@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import morgan from "morgan";
 import dgram from "dgram";
+import net from "net";
 import { Client as SshClient } from "ssh2";
 import { spawn } from "child_process";
 import path from "path";
@@ -20,17 +21,106 @@ const stateDir = path.join(__dirname, "..", "data");
 const hibernatedVmsStatePath = path.join(stateDir, "hibernated-vms.json");
 const schedulePath = path.join(stateDir, "schedule.json");
 
+function parseInteger(value, fallback) {
+  const parsed = Number.parseInt(value ?? String(fallback), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseNumber(value, fallback) {
+  const parsed = Number.parseFloat(value ?? String(fallback));
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (value === undefined) {
+    return fallback;
+  }
+  return ["1", "true", "yes", "on", "sim"].includes(value.toLowerCase());
+}
+
+function parseProxyPorts(value) {
+  const ports = [];
+  const errors = [];
+
+  if (!value) {
+    return { ports, errors };
+  }
+
+  const addPort = (port, token) => {
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      errors.push(`Invalid proxy port "${token}"`);
+      return;
+    }
+    ports.push(port);
+  };
+
+  for (const rawToken of value.split(",")) {
+    const token = rawToken.trim();
+    if (!token) {
+      continue;
+    }
+
+    const rangeMatch = token.match(/^(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      const start = Number.parseInt(rangeMatch[1], 10);
+      const end = Number.parseInt(rangeMatch[2], 10);
+
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start > end) {
+        errors.push(`Invalid proxy port range "${token}"`);
+        continue;
+      }
+
+      for (let port = start; port <= end; port += 1) {
+        addPort(port, token);
+      }
+      continue;
+    }
+
+    if (!/^\d+$/.test(token)) {
+      errors.push(`Invalid proxy port "${token}"`);
+      continue;
+    }
+
+    addPort(Number.parseInt(token, 10), token);
+  }
+
+  return { ports: [...new Set(ports)], errors };
+}
+
+const proxyPortsConfig = parseProxyPorts(process.env.PROXY_PORTS || process.env.PROXY_LISTEN_PORT || "");
+
 const config = {
-  port: Number.parseInt(process.env.PORT || "8080", 10),
+  port: parseInteger(process.env.PORT, 8080),
   wakeMac: process.env.WAKE_MAC || "",
   wakeBroadcast: process.env.WAKE_BROADCAST || "255.255.255.255",
-  wakePort: Number.parseInt(process.env.WAKE_PORT || "9", 10),
+  wakePort: parseInteger(process.env.WAKE_PORT, 9),
   sleepHost: process.env.SLEEP_HOST || "",
-  sshPort: Number.parseInt(process.env.SSH_PORT || "22", 10),
+  sshPort: parseInteger(process.env.SSH_PORT, 22),
   sshUser: process.env.SSH_USER || "root",
   sshPassword: process.env.SSH_PASS || "",
   sleepCommand: process.env.SLEEP_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl suspend",
-  shutdownCommand: process.env.SHUTDOWN_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl poweroff"
+  shutdownCommand: process.env.SHUTDOWN_COMMAND || "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl poweroff",
+  proxyIdleSleepCommand:
+    process.env.PROXY_IDLE_SLEEP_COMMAND ||
+    process.env.SLEEP_COMMAND ||
+    "/usr/sbin/ethtool -s nic0 wol g && /bin/systemctl suspend",
+  proxyEnabled: parseBoolean(process.env.PROXY_ENABLED),
+  proxyListenHost: process.env.PROXY_LISTEN_HOST || "0.0.0.0",
+  proxyPorts: proxyPortsConfig.ports,
+  proxyPortErrors: proxyPortsConfig.errors,
+  proxyTargetHost: process.env.PROXY_TARGET_HOST || process.env.SLEEP_HOST || "",
+  proxyConnectTimeoutMs: parseInteger(process.env.PROXY_CONNECT_TIMEOUT_MS, 1500),
+  proxyWakeTimeoutMs: parseInteger(process.env.PROXY_WAKE_TIMEOUT_MS, 120000),
+  proxyRetryDelayMs: parseInteger(process.env.PROXY_RETRY_DELAY_MS, 2000),
+  proxyIdleSleepEnabled: parseBoolean(process.env.PROXY_IDLE_SLEEP_ENABLED),
+  proxyIdleSleepTimeoutMs: parseInteger(process.env.PROXY_IDLE_SLEEP_TIMEOUT_MS, 1800000),
+  proxyIdleSleepRequireNoConnections: parseBoolean(process.env.PROXY_IDLE_SLEEP_REQUIRE_NO_CONNECTIONS, true),
+  proxyIdleRemoteCheckEnabled: parseBoolean(process.env.PROXY_IDLE_REMOTE_CHECK_ENABLED, true),
+  proxyIdleRemoteCheckSeconds: parseInteger(process.env.PROXY_IDLE_REMOTE_CHECK_SECONDS, 120),
+  proxyIdleRemoteCpuMaxPercent: parseNumber(process.env.PROXY_IDLE_REMOTE_CPU_MAX_PERCENT, 10),
+  proxyIdleRemoteNetMaxBytesPerSecond: parseNumber(process.env.PROXY_IDLE_REMOTE_NET_MAX_BYTES_PER_SECOND, 4096),
+  proxyIdleRemoteNetInterfaces: process.env.PROXY_IDLE_REMOTE_NET_INTERFACES || "",
+  proxyIdleRemoteNetExcludeRegex: process.env.PROXY_IDLE_REMOTE_NET_EXCLUDE_REGEX || "^lo$"
 };
 
 const logsList = [];
@@ -79,6 +169,55 @@ function validateConfig() {
   }
   if (!config.sshPassword) {
     throw new Error("SSH_PASS is required");
+  }
+  if (config.proxyEnabled) {
+    if (!config.proxyTargetHost) {
+      throw new Error("PROXY_TARGET_HOST or SLEEP_HOST is required when PROXY_ENABLED=true");
+    }
+    if (config.proxyPortErrors.length > 0) {
+      throw new Error(config.proxyPortErrors.join("; "));
+    }
+    if (config.proxyPorts.length === 0) {
+      throw new Error("PROXY_PORTS is required when PROXY_ENABLED=true");
+    }
+    if (config.proxyPorts.includes(config.port)) {
+      throw new Error("PROXY_PORTS must not include PORT");
+    }
+    if (!Number.isFinite(config.proxyConnectTimeoutMs) || config.proxyConnectTimeoutMs <= 0) {
+      throw new Error("PROXY_CONNECT_TIMEOUT_MS is invalid");
+    }
+    if (!Number.isFinite(config.proxyWakeTimeoutMs) || config.proxyWakeTimeoutMs <= 0) {
+      throw new Error("PROXY_WAKE_TIMEOUT_MS is invalid");
+    }
+    if (!Number.isFinite(config.proxyRetryDelayMs) || config.proxyRetryDelayMs <= 0) {
+      throw new Error("PROXY_RETRY_DELAY_MS is invalid");
+    }
+    if (config.proxyIdleSleepEnabled) {
+      if (!config.proxyIdleSleepCommand) {
+        throw new Error("PROXY_IDLE_SLEEP_COMMAND or SLEEP_COMMAND is required when PROXY_IDLE_SLEEP_ENABLED=true");
+      }
+      if (!Number.isFinite(config.proxyIdleSleepTimeoutMs) || config.proxyIdleSleepTimeoutMs <= 0) {
+        throw new Error("PROXY_IDLE_SLEEP_TIMEOUT_MS is invalid");
+      }
+      if (config.proxyIdleRemoteCheckEnabled) {
+        if (!Number.isFinite(config.proxyIdleRemoteCheckSeconds) || config.proxyIdleRemoteCheckSeconds <= 0) {
+          throw new Error("PROXY_IDLE_REMOTE_CHECK_SECONDS is invalid");
+        }
+        if (
+          !Number.isFinite(config.proxyIdleRemoteCpuMaxPercent) ||
+          config.proxyIdleRemoteCpuMaxPercent < 0 ||
+          config.proxyIdleRemoteCpuMaxPercent > 100
+        ) {
+          throw new Error("PROXY_IDLE_REMOTE_CPU_MAX_PERCENT is invalid");
+        }
+        if (
+          !Number.isFinite(config.proxyIdleRemoteNetMaxBytesPerSecond) ||
+          config.proxyIdleRemoteNetMaxBytesPerSecond < 0
+        ) {
+          throw new Error("PROXY_IDLE_REMOTE_NET_MAX_BYTES_PER_SECOND is invalid");
+        }
+      }
+    }
   }
 }
 
@@ -257,6 +396,524 @@ function pingHost(host) {
     proc.on("error", () => resolve(false));
     proc.on("close", (code) => resolve(code === 0));
   });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function connectToTcpPort(host, port, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+
+    const cleanup = () => {
+      socket.removeListener("connect", onConnect);
+      socket.removeListener("error", onError);
+      socket.removeListener("timeout", onTimeout);
+      socket.setTimeout(0);
+    };
+
+    const fail = (err) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      socket.destroy();
+      reject(err);
+    };
+
+    const onConnect = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(socket);
+    };
+
+    const onError = (err) => fail(err);
+    const onTimeout = () => fail(new Error(`TCP connect timeout after ${timeoutMs}ms`));
+
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+    socket.once("timeout", onTimeout);
+    socket.setTimeout(timeoutMs);
+  });
+}
+
+const proxyWakeInFlightByPort = new Map();
+let proxyActiveConnections = 0;
+let proxyLastTrafficAt = null;
+let proxyIdleSleepTimer = null;
+let proxyIdleSleepInFlight = null;
+
+function createProxyRoute(listenPort) {
+  return {
+    listenHost: config.proxyListenHost,
+    listenPort,
+    targetHost: config.proxyTargetHost,
+    targetPort: listenPort
+  };
+}
+
+function getProxyRouteKey(route) {
+  return `${route.targetHost}:${route.targetPort}`;
+}
+
+function clearProxyIdleSleepTimer() {
+  if (proxyIdleSleepTimer) {
+    clearTimeout(proxyIdleSleepTimer);
+    proxyIdleSleepTimer = null;
+  }
+}
+
+function scheduleProxyIdleSleepCheck() {
+  clearProxyIdleSleepTimer();
+
+  if (!config.proxyIdleSleepEnabled || !proxyLastTrafficAt) {
+    return;
+  }
+  if (config.proxyIdleSleepRequireNoConnections && proxyActiveConnections > 0) {
+    return;
+  }
+
+  const idleMs = Date.now() - proxyLastTrafficAt;
+  const waitMs = Math.max(config.proxyIdleSleepTimeoutMs - idleMs, 0);
+  proxyIdleSleepTimer = setTimeout(() => {
+    proxyIdleSleepTimer = null;
+    triggerProxyIdleSleepIfIdle().catch((err) => {
+      logError("proxy_idle_sleep_unhandled_error", { error: err.message });
+    });
+  }, waitMs);
+}
+
+function markProxyTraffic(bytes) {
+  if (bytes <= 0) {
+    return;
+  }
+
+  proxyLastTrafficAt = Date.now();
+  scheduleProxyIdleSleepCheck();
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\"'\"'")}'`;
+}
+
+function buildRemoteIdleCheckCommand() {
+  const interval = config.proxyIdleRemoteCheckSeconds;
+  const cpuMaxPercent = config.proxyIdleRemoteCpuMaxPercent;
+  const netMaxBytesPerSecond = config.proxyIdleRemoteNetMaxBytesPerSecond;
+  const includedInterfaces = shellQuote(config.proxyIdleRemoteNetInterfaces);
+  const excludedInterfacesRegex = shellQuote(config.proxyIdleRemoteNetExcludeRegex);
+
+  return `
+INTERVAL=${interval}
+CPU_MAX_PERCENT=${cpuMaxPercent}
+NET_MAX_BPS=${netMaxBytesPerSecond}
+INCLUDED_INTERFACES=${includedInterfaces}
+EXCLUDED_INTERFACES_REGEX=${excludedInterfacesRegex}
+
+read_cpu() {
+  awk '/^cpu / {
+    total = 0
+    for (i = 2; i <= NF; i++) total += $i
+    idle = $5 + $6
+    printf "%.0f %.0f\\n", total, idle
+    exit
+  }' /proc/stat
+}
+
+read_net() {
+  awk -v include="$INCLUDED_INTERFACES" -v exclude="$EXCLUDED_INTERFACES_REGEX" '
+    function trim(value) {
+      gsub(/^[ \\t]+|[ \\t]+$/, "", value)
+      return value
+    }
+    function selected(iface, parts, count, i) {
+      if (include != "") {
+        count = split(include, parts, ",")
+        for (i = 1; i <= count; i++) {
+          if (iface == trim(parts[i])) return 1
+        }
+        return 0
+      }
+      if (exclude != "" && iface ~ exclude) return 0
+      return 1
+    }
+    NR > 2 {
+      iface = $1
+      sub(":", "", iface)
+      if (selected(iface)) total += $2 + $10
+    }
+    END { printf "%.0f\\n", total + 0 }
+  ' /proc/net/dev
+}
+
+set -- $(read_cpu)
+cpu_total_start=$1
+cpu_idle_start=$2
+net_total_start=$(read_net)
+
+sleep "$INTERVAL"
+
+set -- $(read_cpu)
+cpu_total_end=$1
+cpu_idle_end=$2
+net_total_end=$(read_net)
+
+cpu_total_delta=$((cpu_total_end - cpu_total_start))
+cpu_idle_delta=$((cpu_idle_end - cpu_idle_start))
+net_total_delta=$((net_total_end - net_total_start))
+
+if [ "$cpu_total_delta" -lt 0 ]; then cpu_total_delta=0; fi
+if [ "$cpu_idle_delta" -lt 0 ]; then cpu_idle_delta=0; fi
+if [ "$net_total_delta" -lt 0 ]; then net_total_delta=0; fi
+
+awk \\
+  -v cpu_total_delta="$cpu_total_delta" \\
+  -v cpu_idle_delta="$cpu_idle_delta" \\
+  -v net_total_delta="$net_total_delta" \\
+  -v interval="$INTERVAL" \\
+  -v cpu_max="$CPU_MAX_PERCENT" \\
+  -v net_max="$NET_MAX_BPS" \\
+  'BEGIN {
+    cpu_busy = cpu_total_delta > 0 ? ((cpu_total_delta - cpu_idle_delta) * 100 / cpu_total_delta) : 100
+    net_bps = interval > 0 ? (net_total_delta / interval) : 0
+    idle = (cpu_busy <= cpu_max && net_bps <= net_max) ? "true" : "false"
+    printf "{\\"idle\\":%s,\\"cpuBusyPercent\\":%.2f,\\"networkBytesPerSecond\\":%.2f,\\"sampleSeconds\\":%d,\\"cpuMaxPercent\\":%.2f,\\"networkMaxBytesPerSecond\\":%.2f,\\"networkBytesDelta\\":%.0f}\\n", idle, cpu_busy, net_bps, interval, cpu_max, net_max, net_total_delta
+  }'
+`.trim();
+}
+
+function parseRemoteIdleCheckResult(stdout) {
+  const jsonLine = stdout
+    .trim()
+    .split(/\r?\n/)
+    .reverse()
+    .find((line) => line.trim().startsWith("{"));
+
+  if (!jsonLine) {
+    throw new Error("Remote idle check did not return JSON");
+  }
+
+  const parsed = JSON.parse(jsonLine);
+  return {
+    idle: parsed.idle === true,
+    cpuBusyPercent: Number(parsed.cpuBusyPercent),
+    networkBytesPerSecond: Number(parsed.networkBytesPerSecond),
+    sampleSeconds: Number(parsed.sampleSeconds),
+    cpuMaxPercent: Number(parsed.cpuMaxPercent),
+    networkMaxBytesPerSecond: Number(parsed.networkMaxBytesPerSecond),
+    networkBytesDelta: Number(parsed.networkBytesDelta)
+  };
+}
+
+async function checkRemoteIdleOverSsh() {
+  logInfo("proxy_idle_remote_check_started", {
+    host: config.sleepHost,
+    sampleSeconds: config.proxyIdleRemoteCheckSeconds,
+    cpuMaxPercent: config.proxyIdleRemoteCpuMaxPercent,
+    networkMaxBytesPerSecond: config.proxyIdleRemoteNetMaxBytesPerSecond,
+    networkInterfaces: config.proxyIdleRemoteNetInterfaces || "all_except_excluded",
+    networkExcludeRegex: config.proxyIdleRemoteNetExcludeRegex
+  });
+
+  const result = await runCommandOverSsh(buildRemoteIdleCheckCommand());
+  const parsed = parseRemoteIdleCheckResult(result.stdout);
+
+  logInfo("proxy_idle_remote_check_result", {
+    host: config.sleepHost,
+    ...parsed
+  });
+
+  return parsed;
+}
+
+async function triggerProxyIdleSleepIfIdle() {
+  if (!config.proxyIdleSleepEnabled || !proxyLastTrafficAt || proxyIdleSleepInFlight) {
+    return;
+  }
+  if (config.proxyIdleSleepRequireNoConnections && proxyActiveConnections > 0) {
+    scheduleProxyIdleSleepCheck();
+    return;
+  }
+
+  const idleMs = Date.now() - proxyLastTrafficAt;
+  if (idleMs < config.proxyIdleSleepTimeoutMs) {
+    scheduleProxyIdleSleepCheck();
+    return;
+  }
+
+  const checkedTrafficAt = proxyLastTrafficAt;
+  const idleSince = new Date(proxyLastTrafficAt).toISOString();
+  proxyIdleSleepInFlight = (async () => {
+    try {
+      let remoteIdleCheck = { idle: true };
+
+      if (config.proxyIdleRemoteCheckEnabled) {
+        remoteIdleCheck = await checkRemoteIdleOverSsh();
+
+        if (!remoteIdleCheck.idle) {
+          proxyLastTrafficAt = Date.now();
+          logInfo("proxy_idle_sleep_skipped_remote_busy", {
+            host: config.sleepHost,
+            idleSince,
+            cpuBusyPercent: remoteIdleCheck.cpuBusyPercent,
+            cpuMaxPercent: remoteIdleCheck.cpuMaxPercent,
+            networkBytesPerSecond: remoteIdleCheck.networkBytesPerSecond,
+            networkMaxBytesPerSecond: remoteIdleCheck.networkMaxBytesPerSecond
+          });
+          return;
+        }
+      }
+
+      if (proxyLastTrafficAt !== checkedTrafficAt) {
+        logInfo("proxy_idle_sleep_skipped_local_activity", {
+          host: config.sleepHost,
+          idleSince
+        });
+        return;
+      }
+      if (config.proxyIdleSleepRequireNoConnections && proxyActiveConnections > 0) {
+        logInfo("proxy_idle_sleep_skipped_active_connections", {
+          host: config.sleepHost,
+          idleSince,
+          activeConnections: proxyActiveConnections
+        });
+        return;
+      }
+
+      proxyLastTrafficAt = null;
+      const result = await runCommandOverSsh(config.proxyIdleSleepCommand);
+      logInfo("proxy_idle_sleep_sent", {
+        host: config.sleepHost,
+        idleMs,
+        idleSince,
+        remoteIdleCheck,
+        stdout: result.stdout.trim(),
+        stderr: result.stderr.trim()
+      });
+    } catch (err) {
+      proxyLastTrafficAt = Date.now();
+      logError("proxy_idle_sleep_failed", {
+        host: config.sleepHost,
+        idleMs,
+        idleSince,
+        error: err.message
+      });
+    } finally {
+      proxyIdleSleepInFlight = null;
+      scheduleProxyIdleSleepCheck();
+    }
+  })();
+
+  await proxyIdleSleepInFlight;
+}
+
+async function waitForProxyTargetPort(route) {
+  const deadline = Date.now() + config.proxyWakeTimeoutMs;
+  let attempt = 0;
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    attempt += 1;
+
+    try {
+      const probeSocket = await connectToTcpPort(
+        route.targetHost,
+        route.targetPort,
+        config.proxyConnectTimeoutMs
+      );
+      probeSocket.end();
+      logInfo("proxy_target_port_available", {
+        host: route.targetHost,
+        port: route.targetPort,
+        attempt
+      });
+      return;
+    } catch (err) {
+      lastError = err;
+      await delay(Math.min(config.proxyRetryDelayMs, Math.max(deadline - Date.now(), 0)));
+    }
+  }
+
+  throw new Error(
+    `Remote port ${route.targetHost}:${route.targetPort} did not become available` +
+      (lastError ? ` (${lastError.message})` : "")
+  );
+}
+
+async function wakeAndWaitForProxyTarget(route) {
+  const routeKey = getProxyRouteKey(route);
+  const existingWake = proxyWakeInFlightByPort.get(routeKey);
+
+  if (existingWake) {
+    logInfo("proxy_wake_wait_joined", {
+      targetHost: route.targetHost,
+      targetPort: route.targetPort
+    });
+    return existingWake;
+  }
+
+  const wakePromise = (async () => {
+    await sendWakePacket(config.wakeMac, config.wakeBroadcast, config.wakePort);
+    logInfo("proxy_wake_sent", {
+      mac: config.wakeMac,
+      broadcast: config.wakeBroadcast,
+      port: config.wakePort,
+      targetHost: route.targetHost,
+      targetPort: route.targetPort
+    });
+    await waitForProxyTargetPort(route);
+  })().finally(() => {
+    proxyWakeInFlightByPort.delete(routeKey);
+  });
+
+  proxyWakeInFlightByPort.set(routeKey, wakePromise);
+  return wakePromise;
+}
+
+async function openProxyTargetSocket(route) {
+  try {
+    return await connectToTcpPort(route.targetHost, route.targetPort, config.proxyConnectTimeoutMs);
+  } catch (err) {
+    logInfo("proxy_target_unavailable_waking", {
+      host: route.targetHost,
+      port: route.targetPort,
+      error: err.message
+    });
+    await wakeAndWaitForProxyTarget(route);
+    return connectToTcpPort(route.targetHost, route.targetPort, config.proxyConnectTimeoutMs);
+  }
+}
+
+async function handleProxyConnection(clientSocket, route) {
+  const client = `${clientSocket.remoteAddress || "unknown"}:${clientSocket.remotePort || "unknown"}`;
+  let targetSocket = null;
+  let clientClosed = false;
+
+  proxyActiveConnections += 1;
+  clearProxyIdleSleepTimer();
+
+  clientSocket.pause();
+  clientSocket.setKeepAlive(true);
+  clientSocket.on("error", (err) => {
+    logError("proxy_client_error", { client, error: err.message });
+  });
+  clientSocket.once("close", () => {
+    clientClosed = true;
+    proxyActiveConnections = Math.max(proxyActiveConnections - 1, 0);
+    if (targetSocket && !targetSocket.destroyed) {
+      targetSocket.destroy();
+    }
+    scheduleProxyIdleSleepCheck();
+  });
+
+  try {
+    logInfo("proxy_client_connected", {
+      client,
+      listenPort: route.listenPort,
+      targetHost: route.targetHost,
+      targetPort: route.targetPort
+    });
+
+    targetSocket = await openProxyTargetSocket(route);
+    if (clientClosed || clientSocket.destroyed) {
+      targetSocket.destroy();
+      logInfo("proxy_client_disconnected_before_target_ready", { client });
+      return;
+    }
+
+    targetSocket.setKeepAlive(true);
+
+    targetSocket.on("error", (err) => {
+      logError("proxy_target_error", {
+        client,
+        targetHost: route.targetHost,
+        targetPort: route.targetPort,
+        error: err.message
+      });
+    });
+
+    targetSocket.once("close", () => {
+      if (!clientSocket.destroyed) {
+        clientSocket.destroy();
+      }
+    });
+
+    clientSocket.pipe(targetSocket);
+    targetSocket.pipe(clientSocket);
+    clientSocket.on("data", (chunk) => {
+      markProxyTraffic(chunk.length);
+    });
+    targetSocket.on("data", (chunk) => {
+      markProxyTraffic(chunk.length);
+    });
+    clientSocket.resume();
+
+    logInfo("proxy_connection_established", {
+      client,
+      listenPort: route.listenPort,
+      targetHost: route.targetHost,
+      targetPort: route.targetPort
+    });
+  } catch (err) {
+    logError("proxy_connection_failed", {
+      client,
+      listenPort: route.listenPort,
+      targetHost: route.targetHost,
+      targetPort: route.targetPort,
+      error: err.message
+    });
+    clientSocket.destroy();
+  }
+}
+
+function startWakeProxyListener(route) {
+  const proxyServer = net.createServer((clientSocket) => {
+    handleProxyConnection(clientSocket, route).catch((err) => {
+      logError("proxy_unhandled_connection_error", {
+        listenPort: route.listenPort,
+        targetHost: route.targetHost,
+        targetPort: route.targetPort,
+        error: err.message
+      });
+      clientSocket.destroy();
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    const onError = (err) => {
+      proxyServer.removeListener("listening", onListening);
+      reject(err);
+    };
+
+    const onListening = () => {
+      proxyServer.removeListener("error", onError);
+      logInfo("proxy_listening", {
+        listenHost: route.listenHost,
+        listenPort: route.listenPort,
+        targetHost: route.targetHost,
+        targetPort: route.targetPort
+      });
+      resolve(proxyServer);
+    };
+
+    proxyServer.once("error", onError);
+    proxyServer.once("listening", onListening);
+    proxyServer.listen(route.listenPort, route.listenHost);
+  });
+}
+
+async function startWakeProxy() {
+  if (!config.proxyEnabled) {
+    return [];
+  }
+
+  return Promise.all(config.proxyPorts.map((port) => startWakeProxyListener(createProxyRoute(port))));
 }
 
 async function executeAction(action) {
@@ -513,6 +1170,7 @@ app.post("/api/shutdown", async (req, res) => {
 try {
   validateConfig();
   await loadSchedule();
+  await startWakeProxy();
   app.listen(config.port, () => {
     logInfo("server_listening", { port: config.port });
   });
